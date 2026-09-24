@@ -4,7 +4,7 @@ on:
     tags: "*"
 
 env:
-  IMAGE_NAME: ghcr.io/myjettools/web-app-host
+  IMAGE_NAME: ghcr.io/my-jet-tools/web-app-host
 
 jobs:
   build:
