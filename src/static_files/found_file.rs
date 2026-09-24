@@ -6,7 +6,8 @@ use super::CachedContent;
 pub struct FoundFile {
     pub content: CachedContent,
     /// Uri path of the file within the root folder. It differs from the requested one
-    /// when the file is not found and the index file renders the SPA route
+    /// when the folder is requested and its index file is served - or when the file
+    /// is not found and the index file renders the SPA route
     pub uri_path: String,
     /// Index file is the entry point of the application - it is never cached
     pub is_index_file: bool,

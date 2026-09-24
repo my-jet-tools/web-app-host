@@ -16,3 +16,5 @@ mod serve_params;
 pub use serve_params::*;
 mod static_files_reader;
 pub use static_files_reader::*;
+mod uri_path;
+pub use uri_path::*;
