@@ -35,7 +35,8 @@ impl StaticFilesReader {
     /// its index file is served. If it is nowhere - the index file of the first folder
     /// renders the SPA route
     pub async fn find_file(&self, uri_path: &str, folders: &[&str]) -> Option<FoundFile> {
-        // path which leads out of the root folder is never looked up - it is the SPA route
+        // path which leads out of the root folder is rejected by the middleware as forbidden.
+        // If it gets here anyway - it is never looked up
         if is_safe_uri_path(uri_path) {
             for folder in folders {
                 if let Some(found_file) = self.find_in_folder(folder, uri_path).await {
