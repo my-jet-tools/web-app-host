@@ -2,20 +2,22 @@ use std::collections::HashMap;
 
 use tokio::sync::RwLock;
 
-use super::{calc_etag, try_zstd, CachedContent};
+use super::{calc_etag, try_compress, CachedContent, CompressionSettings};
 
 /// Reads the files from the disk - with the optional in-memory caching.
 /// Caching is about the server side only - it has nothing to do with the caching headers
 pub struct FilesAccess {
     cache: RwLock<HashMap<String, CachedContent>>,
     enable_caching: bool,
+    compression: CompressionSettings,
 }
 
 impl FilesAccess {
-    pub fn new(enable_caching: bool) -> Self {
+    pub fn new(enable_caching: bool, compression: CompressionSettings) -> Self {
         Self {
             cache: RwLock::new(HashMap::new()),
             enable_caching,
+            compression,
         }
     }
 
@@ -34,30 +36,40 @@ impl FilesAccess {
         if !self.enable_caching {
             return Some(CachedContent {
                 data: raw,
-                is_zstd: false,
+                compression: None,
                 etag: None,
             });
         }
 
-        let etag = Some(calc_etag(&raw));
+        let compression = self.compression;
 
-        let entry = match try_zstd(&raw) {
-            Some(compressed) => CachedContent {
-                data: compressed,
-                is_zstd: true,
-                etag,
-            },
-            None => CachedContent {
-                data: raw,
-                is_zstd: false,
-                etag,
-            },
-        };
+        // the maximum compression level takes seconds for the big file -
+        // it must not block the threads of the async runtime
+        let entry = tokio::task::spawn_blocking(move || compile_cached_content(raw, compression))
+            .await
+            .ok()?;
 
         let mut cache = self.cache.write().await;
         cache.insert(file_name, entry.clone());
 
         Some(entry)
+    }
+}
+
+fn compile_cached_content(raw: Vec<u8>, compression: CompressionSettings) -> CachedContent {
+    let etag = Some(calc_etag(&raw));
+
+    match try_compress(&raw, compression) {
+        Some(compressed) => CachedContent {
+            data: compressed,
+            compression: Some(compression.algorithm),
+            etag,
+        },
+        None => CachedContent {
+            data: raw,
+            compression: None,
+            etag,
+        },
     }
 }
 

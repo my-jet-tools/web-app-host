@@ -3,7 +3,9 @@ use std::{net::SocketAddr, sync::Arc};
 use is_alive_middleware::IsAliveMiddleware;
 use my_http_server::MyHttpServer;
 
-use crate::static_files::StaticFilesReader;
+use crate::static_files::{
+    CompressionAlgorithm, CompressionLevel, CompressionSettings, StaticFilesReader,
+};
 
 pub async fn setup_server(
     tcp_listen_addr: SocketAddr,
@@ -57,12 +59,23 @@ pub async fn setup_server(
         println!("WITH_MOBILE=1 — serving content from the desktop and the mobile folders");
     }
 
-    if !files_caching_enabled() {
+    let compression = get_compression_settings();
+
+    if files_caching_enabled() {
+        println!(
+            "Cached files are compressed with {} — {:?} compression level",
+            compression.algorithm.as_str(),
+            compression.level
+        );
+    } else {
         println!("FILES_CACHING_DISABLED=1 — in-memory files caching is disabled");
     }
 
-    let static_files =
-        StaticFilesReader::new(files_caching_enabled(), get_disable_cache_list().await);
+    let static_files = StaticFilesReader::new(
+        files_caching_enabled(),
+        compression,
+        get_disable_cache_list().await,
+    );
 
     let request_flow_middleware = Arc::new(super::RequestFlowMiddleware::new(static_files));
 
@@ -92,6 +105,32 @@ fn files_caching_enabled() -> bool {
         Ok(value) => value.trim() != "1",
         Err(_) => true,
     }
+}
+
+/// Unsupported algorithm is the mistake of the configuration - the service does not start with it
+fn get_compression_settings() -> CompressionSettings {
+    let mut result = CompressionSettings::default();
+
+    if let Ok(value) = std::env::var("COMPRESSION_ALGORITHM") {
+        if !value.trim().is_empty() {
+            result.algorithm = CompressionAlgorithm::parse(value.as_str()).unwrap_or_else(|| {
+                panic!(
+                    "COMPRESSION_ALGORITHM='{}' is not supported. Supported values: zstd, br, gzip, deflate",
+                    value
+                )
+            });
+        }
+    }
+
+    if let Ok(value) = std::env::var("MAX_COMPRESSION") {
+        let value = value.trim();
+
+        if value == "1" || value.eq_ignore_ascii_case("true") {
+            result.level = CompressionLevel::Max;
+        }
+    }
+
+    result
 }
 
 async fn get_disable_cache_list() -> Vec<String> {

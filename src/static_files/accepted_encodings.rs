@@ -1,9 +1,13 @@
 use my_http_server::{HttpContext, HttpRequestHeaders};
 
+use super::CompressionAlgorithm;
+
 /// Encodings the client is ready to accept
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AcceptedEncodings {
     pub zstd: bool,
+    pub brotli: bool,
+    pub gzip: bool,
     pub deflate: bool,
 }
 
@@ -24,6 +28,15 @@ impl AcceptedEncodings {
         Self::parse(header)
     }
 
+    pub fn accepts(&self, algorithm: CompressionAlgorithm) -> bool {
+        match algorithm {
+            CompressionAlgorithm::Zstd => self.zstd,
+            CompressionAlgorithm::Brotli => self.brotli,
+            CompressionAlgorithm::Gzip => self.gzip,
+            CompressionAlgorithm::Deflate => self.deflate,
+        }
+    }
+
     fn parse(header_value: &str) -> Self {
         let mut result = Self::default();
 
@@ -37,6 +50,10 @@ impl AcceptedEncodings {
 
             if name.eq_ignore_ascii_case("zstd") {
                 result.zstd = true;
+            } else if name.eq_ignore_ascii_case("br") {
+                result.brotli = true;
+            } else if name.eq_ignore_ascii_case("gzip") {
+                result.gzip = true;
             } else if name.eq_ignore_ascii_case("deflate") {
                 result.deflate = true;
             }
@@ -76,5 +93,18 @@ mod tests {
         let result = AcceptedEncodings::parse("gzip, br");
         assert!(!result.zstd);
         assert!(!result.deflate);
+    }
+
+    #[test]
+    fn parses_brotli_and_gzip() {
+        let result = AcceptedEncodings::parse("gzip, deflate, br, zstd");
+        assert!(result.accepts(CompressionAlgorithm::Zstd));
+        assert!(result.accepts(CompressionAlgorithm::Brotli));
+        assert!(result.accepts(CompressionAlgorithm::Gzip));
+        assert!(result.accepts(CompressionAlgorithm::Deflate));
+
+        let result = AcceptedEncodings::parse("BR;q=1.0");
+        assert!(result.accepts(CompressionAlgorithm::Brotli));
+        assert!(!result.accepts(CompressionAlgorithm::Gzip));
     }
 }

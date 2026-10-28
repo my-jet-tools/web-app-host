@@ -6,8 +6,8 @@ use my_http_server::{
 use crate::models::INDEX_FILE;
 
 use super::{
-    compile_folder_index_path, is_safe_uri_path, AcceptedEncodings, FilesAccess, FoundFile,
-    NoCache, ServeParams,
+    compile_folder_index_path, is_safe_uri_path, AcceptedEncodings, CompressionSettings,
+    FilesAccess, FoundFile, NoCache, ServeParams,
 };
 
 /// Full set of headers which forbids any caching of the content
@@ -24,9 +24,13 @@ pub struct StaticFilesReader {
 }
 
 impl StaticFilesReader {
-    pub fn new(enable_files_caching: bool, no_cache_paths: Vec<String>) -> Self {
+    pub fn new(
+        enable_files_caching: bool,
+        compression: CompressionSettings,
+        no_cache_paths: Vec<String>,
+    ) -> Self {
         Self {
-            files_access: FilesAccess::new(enable_files_caching),
+            files_access: FilesAccess::new(enable_files_caching, compression),
             no_cache: NoCache::new(no_cache_paths),
         }
     }
@@ -218,7 +222,7 @@ mod tests {
     }
 
     async fn find_file(folders: &[&str], uri_path: &str) -> FoundFile {
-        StaticFilesReader::new(true, vec![])
+        StaticFilesReader::new(true, CompressionSettings::default(), vec![])
             .find_file(uri_path, folders)
             .await
             .unwrap()
@@ -368,7 +372,7 @@ mod tests {
     fn create_found_file(uri_path: &str) -> FoundFile {
         let content = CachedContent {
             data: vec![],
-            is_zstd: false,
+            compression: None,
             etag: None,
         };
 
@@ -378,7 +382,8 @@ mod tests {
     fn has_to_disable_caching(no_cache: &[&str], request_path: &str, uri_path: &str) -> bool {
         let no_cache = no_cache.iter().map(|itm| itm.to_string()).collect();
 
-        StaticFilesReader::new(true, no_cache).has_to_disable_caching(
+        StaticFilesReader::new(true, CompressionSettings::default(), no_cache)
+            .has_to_disable_caching(
             &HttpPath::from_str(request_path),
             &create_found_file(uri_path),
         )
