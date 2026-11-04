@@ -1,111 +1,111 @@
 # web-app-host
 
-Лёгкий HTTP-сервер для отдачи статического SPA из папки `./wwwroot`. Слушает `0.0.0.0:8000` по TCP и (на Unix) опционально на Unix-сокете.
+A lightweight HTTP server that serves a static SPA from the `./wwwroot` folder. It listens on `0.0.0.0:8000` over TCP and, on Unix, optionally on a Unix socket.
 
-Возможности:
-- Раздача статических файлов с ETag;
-- Запрос папки (`/es/`, `/es`) отдаёт `index.html` этой папки — для многостраничных статических сайтов;
-- SPA-fallback на `index.html`;
-- `is-alive` endpoint с именем и версией приложения;
-- Подстановка плейсхолдеров версии в указанный файл при отдаче;
-- Список путей, исключаемых из кэша;
-- Сжатые копии контента в `br` и `gzip` с максимальной степенью сжатия — создаются при старте, клиент получает лучшую из тех, что он принимает;
-- Опциональный режим desktop/mobile — раздача из двух папок по `User-Agent`;
-- Опциональная защита сайта паролем через Basic Auth;
-- Опциональный `robots.txt`, запрещающий поисковикам обходить сайт.
+Features:
+- Static files served with ETags;
+- A folder request (`/es/`, `/es`) serves that folder's `index.html` — for multi-page static sites;
+- SPA fallback to `index.html`;
+- `is-alive` endpoint with the application name and version;
+- Version placeholders substituted in a configured file at serve time;
+- A list of paths excluded from caching;
+- `br` and `gzip` copies of the content, compressed at the maximum level at startup — each client gets the best one it accepts;
+- Optional desktop/mobile mode — content served from two folders by `User-Agent`;
+- Optional password protection via Basic Auth;
+- Optional `robots.txt` that forbids crawlers to crawl the site.
 
-## Переменные окружения
+## Environment variables
 
-| Переменная | По умолчанию | Описание |
+| Variable | Default | Description |
 |---|---|---|
-| `UNIX_SOCKET` | не задана | Только на Unix. Путь к Unix-сокету. Если задана — сервер дополнительно слушает на этом сокете (TCP `:8000` остаётся в любом случае). |
-| `BUILD_NAME` | `web-app-host` (`CARGO_PKG_NAME`) | Имя приложения, возвращаемое `is-alive`-эндпоинтом. |
-| `BUILD_VERSION` | `CARGO_PKG_VERSION` из `Cargo.toml` | Версия приложения. Возвращается `is-alive` и подставляется вместо `${APP_VERSION}` в инжектируемом файле. |
-| `COMPILE_TIME` | пустая строка | Метка времени сборки. Подставляется вместо `${APP_COMPILE_TIME}` в инжектируемом файле. |
-| `FILE_TO_VERSION_INJECTION` | не задана | Путь файла (относительно корня сайта), в который при отдаче подставляются `${APP_VERSION}` и `${APP_COMPILE_TIME}`. Если не задана — инжекция отключена. |
-| `HOME` | задаётся системой (в Docker от root — `/root`) | Папка, в которой при старте создаются сжатые копии контента: `$HOME/wwwroot-br` и `$HOME/wwwroot-gzip`. Если не задана — копии не создаются, файлы отдаются без сжатия. См. [Сжатие](#сжатие). |
-| `WITH_MOBILE` | не задана | Если `=1` — включает режим desktop/mobile: контент отдаётся из `./wwwroot/desktop` и `./wwwroot/mobile`. Любое другое значение или отсутствие переменной — раздача из `./wwwroot` как обычно. |
-| `BASIC-AUTH` | не задана | Пароль Basic Auth. Если задана и не пустая — без правильного пароля сервер отвечает `401` с `WWW-Authenticate: Basic`, и браузер показывает окно логина. Логин может быть любым, проверяется только пароль. Имя с дефисом нельзя выставить через `export` в shell, поэтому принимается и `BASIC_AUTH`. |
-| `NO_ROBOTS` | не задана | Если `=true` (или `=1`) — на `/robots.txt` отдаётся `User-agent: *` / `Disallow: /`, запрещающий поисковикам обходить (и индексировать) сайт. Файл `robots.txt` из `./wwwroot` при этом игнорируется. |
+| `UNIX_SOCKET` | not set | Unix only. Path to a Unix socket. If set, the server also listens on this socket (TCP `:8000` stays on in any case). |
+| `BUILD_NAME` | `web-app-host` (`CARGO_PKG_NAME`) | Application name returned by the `is-alive` endpoint. |
+| `BUILD_VERSION` | `CARGO_PKG_VERSION` from `Cargo.toml` | Application version. Returned by `is-alive` and substituted for `${APP_VERSION}` in the injected file. |
+| `COMPILE_TIME` | empty string | Build timestamp. Substituted for `${APP_COMPILE_TIME}` in the injected file. |
+| `FILE_TO_VERSION_INJECTION` | not set | Path of the file (relative to the site root) in which `${APP_VERSION}` and `${APP_COMPILE_TIME}` are substituted at serve time. If not set, the injection is disabled. |
+| `HOME` | set by the system (`/root` in Docker when running as root) | Folder in which the compressed copies of the content are created at startup: `$HOME/wwwroot-br` and `$HOME/wwwroot-gzip`. If not set, no copies are created and files are served uncompressed. See [Compression](#compression). |
+| `WITH_MOBILE` | not set | `=1` enables the desktop/mobile mode: content is served from `./wwwroot/desktop` and `./wwwroot/mobile`. Any other value, or no variable, serves `./wwwroot` as usual. |
+| `BASIC-AUTH` | not set | Basic Auth password. If set and not empty, a request without the correct password gets `401` with `WWW-Authenticate: Basic`, and the browser shows a login prompt. Any login is accepted — only the password is checked. A name with a dash cannot be set via `export` in a shell, so `BASIC_AUTH` is accepted as well. |
+| `NO_ROBOTS` | not set | `=true` (or `=1`) serves `User-agent: *` / `Disallow: /` at `/robots.txt`, which forbids crawlers to crawl (and index) the site. `robots.txt` from `./wwwroot` is ignored in this case. |
 
-## Сжатие
+## Compression
 
-При старте сервис обходит папку с контентом и создаёт её сжатые копии — с той же структурой папок:
+At startup the service walks the content folder and creates its compressed copies — with the same folder structure:
 
-| Папка | `Content-Encoding` | Степень сжатия |
+| Folder | `Content-Encoding` | Compression level |
 |---|---|---|
-| `$HOME/wwwroot-br` | `br` | качество 11 (максимум). Окно — наименьшее, которое покрывает файл, но не больше 16 МБ (максимум стандартного brotli): сжимает так же, как окно 16 МБ, но требует меньше памяти и при сжатии, и в браузере |
-| `$HOME/wwwroot-gzip` | `gzip` | уровень 9 (максимум) |
+| `$HOME/wwwroot-br` | `br` | Quality 11 (maximum). The window is the smallest one that covers the file, up to 16 MB (the maximum of the standard brotli): it compresses as well as the 16 MB window, but takes less memory — both to compress and to decompress in the browser |
+| `$HOME/wwwroot-gzip` | `gzip` | Level 9 (maximum) |
 
-- HTTP-сервер (вместе с `is-alive`) поднимается только после того, как созданы все копии. Время подготовки печатается в лог: `Content of './wwwroot' is ready in 1.9s: 120 files, 40 br copies, 40 gzip copies`. `br` с качеством 11 — примерно 1.5 с на мегабайт в одном потоке. Файлы сжимаются во все доступные ядра (с учётом CPU-лимита контейнера), самые большие — первыми. Если сайт большой — учитывайте время старта в liveness-пробе.
-- Копии предыдущего запуска удаляются при старте. Контент сканируется один раз: файлы, которые появились или изменились после старта, сервис не увидит — нужен рестарт.
-- Копия создаётся, только если файл больше 10 КБ и сжатый результат не больше 80% исходного. Уже сжатые форматы — картинки, видео, аудио, `woff`/`woff2`, архивы — не сжимаются вообще.
-- Вариант выбирается по `Accept-Encoding`: сначала `br`, потом `gzip`. Кодировка с `q=0` считается отклонённой. Если подходящей копии нет — отдаётся исходный файл без сжатия. В ответе всегда есть `Vary: Accept-Encoding`.
-- В памяти хранится только индекс: пути файлов и ETag'и. У каждого варианта — исходного, `br` и `gzip` — свой ETag (SHA-256 его байтов), поэтому `304` приходит только на ETag того же варианта. Содержимое файлов читается с диска на каждый запрос.
-- Если `HOME` не задана или папку копий не удалось создать — копий нет, файлы отдаются без сжатия.
-- Файл из `FILE_TO_VERSION_INJECTION` всегда отдаётся без сжатия: версия подставляется в исходный файл.
-- При `WITH_MOBILE=1` копии создаются отдельно для `desktop` и `mobile` — см. [Режим desktop / mobile](#режим-desktop--mobile-with_mobile1).
+- The HTTP server (including `is-alive`) starts only when all the copies are created. The preparation time is printed to the log: `Content of './wwwroot' is ready in 1.9s: 120 files, 40 br copies, 40 gzip copies`. `br` with quality 11 takes about 1.5 s per megabyte in a single thread. Files are compressed on all available cores (respecting the CPU limit of the container), the biggest ones first. For a big site, take the startup time into account in the liveness probe.
+- The copies of the previous run are removed at startup. The content is scanned once: files that appear or change after the startup are not picked up — a restart is required.
+- A copy is created only if the file is bigger than 10 KB and the compressed result is at most 80% of the original. Formats that are compressed already — images, video, audio, `woff`/`woff2`, archives — are not compressed at all.
+- The variant is chosen by `Accept-Encoding`: `br` first, then `gzip`. An encoding with `q=0` is treated as refused. If there is no suitable copy, the original file is served uncompressed. The response always has `Vary: Accept-Encoding`.
+- Only the index is kept in memory: file paths and ETags. Each variant — the original, `br` and `gzip` — has its own ETag (SHA-256 of its bytes), so `304` is returned only for the ETag of the same variant. The content of the files is read from the disk on each request.
+- If `HOME` is not set or a copies folder can not be created, there are no copies and the files are served uncompressed.
+- The `FILE_TO_VERSION_INJECTION` file is always served uncompressed: the version is substituted in the original file.
+- With `WITH_MOBILE=1` the copies are created separately for `desktop` and `mobile` — see [Desktop / mobile mode](#desktop--mobile-mode-with_mobile1).
 
-Пример на реальных файлах (release-сборка, сжатие в один поток):
+Example on real files (release build, single-threaded compression; sizes in bytes, compression time in parentheses):
 
-| Файл | Исходный | `br` | `gzip` |
+| File | Original | `br` | `gzip` |
 |---|---|---|---|
-| `react-dom.development.js` | 1 080 227 | 181 054 (1 451 мс) | 232 853 (53 мс) |
-| `bootstrap.min.css` | 232 803 | 22 701 (304 мс) | 30 953 (5 мс) |
+| `react-dom.development.js` | 1,080,227 | 181,054 (1,451 ms) | 232,853 (53 ms) |
+| `bootstrap.min.css` | 232,803 | 22,701 (304 ms) | 30,953 (5 ms) |
 
 ## Basic Auth (`BASIC-AUTH`)
 
-- Проверяется каждый запрос, кроме `is-alive` и `/robots.txt` (при `NO_ROBOTS=true`), — они остаются открытыми для healthcheck'ов и поисковиков.
-- В `realm` подставляется имя приложения (`BUILD_NAME`).
-- Пароль сравнивается по SHA-256-хэшам — время сравнения не зависит от того, сколько символов совпало.
+- Every request is checked except `is-alive` and `/robots.txt` (with `NO_ROBOTS=true`) — they stay open for health checks and crawlers.
+- The application name (`BUILD_NAME`) is used as the `realm`.
+- The password is compared by SHA-256 hashes — the comparison time does not depend on how many characters match.
 
-## Режим desktop / mobile (`WITH_MOBILE=1`)
+## Desktop / mobile mode (`WITH_MOBILE=1`)
 
-Корень сайта разбивается на две папки:
+The site root is split into two folders:
 
-| Файл | Описание |
+| Folder | Description |
 |---|---|
-| `./wwwroot/desktop/` | Контент для desktop. Свой `index.html` (index + not-found fallback). |
-| `./wwwroot/mobile/` | Контент для mobile. Свой `index.html` (index + not-found fallback). |
+| `./wwwroot/desktop/` | Content for desktop. Has its own `index.html` (index + not-found fallback). |
+| `./wwwroot/mobile/` | Content for mobile. Has its own `index.html` (index + not-found fallback). |
 
-Как это работает:
+How it works:
 
-1. Тип устройства определяется по заголовку `User-Agent` через `rust-common` (`UserAgentString::get_device_type()`). `Mobile` → папка `mobile`; `Desktop` и `Tablet` → папка `desktop`. Если заголовка нет или он нечитаемый — `desktop`.
-2. Файл ищется сначала в папке своего устройства, потом — в другой. То есть mobile-клиент получит файл из `desktop`, если в `mobile` его нет, и наоборот. `index.html` запрошенной папки ищется в том же порядке: `/es/` отдаст `mobile/es/index.html`, а если его нет — `desktop/es/index.html`.
-3. Если файла нет нигде — отдаётся `index.html` из папки своего устройства (SPA-fallback).
-4. **`index.html` не кэшируется вообще** — ни прямой запрос `/index.html`, ни `/`, ни любой SPA-роут. Именно этот файл решает, какое из двух приложений получит устройство, поэтому его закэшированная копия недопустима.
-5. Ко всем ответам добавляется заголовок `Vary: User-Agent` — один и тот же URL отдаёт разный контент, и промежуточные кэши должны об этом знать.
-6. Пути из `./www-system/.disable-cache` регистрируются для обеих папок, `FILE_TO_VERSION_INJECTION` сравнивается с путём отдаваемого файла (для запроса папки — с путём её `index.html`), а файл читается из папки, которая была выбрана для устройства.
-7. У каждого устройства свои сжатые копии: `$HOME/wwwroot-br/desktop/`, `$HOME/wwwroot-br/mobile/` и так же для `gzip`. Файл, взятый из другой папки (п. 2), отдаётся со сжатыми копиями этой папки. Файлы в корне `./wwwroot` вне `desktop` и `mobile` в этом режиме не сканируются и не отдаются.
+1. The device type is detected by the `User-Agent` header via `rust-common` (`UserAgentString::get_device_type()`). `Mobile` → the `mobile` folder; `Desktop` and `Tablet` → the `desktop` folder. If the header is missing or unreadable — `desktop`.
+2. A file is looked up in the folder of the device first, then in the other one. So a mobile client gets the file from `desktop` if `mobile` does not have it, and vice versa. The `index.html` of a requested folder is looked up in the same order: `/es/` serves `mobile/es/index.html`, and if there is none — `desktop/es/index.html`.
+3. If the file is nowhere, the `index.html` of the device folder is served (SPA fallback).
+4. **`index.html` is never cached** — neither a direct `/index.html` request, nor `/`, nor any SPA route. This is the file that decides which of the two applications the device gets, so a cached copy of it is not acceptable.
+5. All responses get the `Vary: User-Agent` header — the same URL serves different content, and the caches in between must know it.
+6. Paths from `./www-system/.disable-cache` are registered for both folders, `FILE_TO_VERSION_INJECTION` is compared with the path of the served file (for a folder request — with the path of its `index.html`), and the file is read from the folder chosen for the device.
+7. Each device has its own compressed copies: `$HOME/wwwroot-br/desktop/`, `$HOME/wwwroot-br/mobile/`, and the same for `gzip`. A file taken from the other folder (item 2) is served with the compressed copies of that folder. Files in the root of `./wwwroot` outside `desktop` and `mobile` are neither scanned nor served in this mode.
 
-## Файлы конфигурации
+## Configuration files
 
-| Файл | Описание |
+| File | Description |
 |---|---|
-| `./wwwroot/` | Корень статических файлов. Index-файл и not-found fallback — `index.html` (нужен для SPA-роутинга). При `WITH_MOBILE=1` — `./wwwroot/desktop/` и `./wwwroot/mobile/`. |
-| `./www-system/.disable-cache` | Опциональный список путей, исключаемых из кэша. По одному пути в строке, пустые строки игнорируются. Пути `/` и `/index.html` исключены из кэша всегда. Если файл отсутствует — печатается сообщение и используется пустой список. |
+| `./wwwroot/` | Root of the static files. The index file and the not-found fallback is `index.html` (required for SPA routing). With `WITH_MOBILE=1` — `./wwwroot/desktop/` and `./wwwroot/mobile/`. |
+| `./www-system/.disable-cache` | Optional list of paths excluded from caching. One path per line, empty lines are ignored. `/` and `/index.html` are always excluded from caching. If the file is missing, a message is printed and an empty list is used. |
 
-## Кэширование
+## Caching
 
-| Что | Заголовки |
+| What | Headers |
 |---|---|
-| `/`, `/index.html` и пути из `.disable-cache` | `Cache-Control: no-store, no-cache, must-revalidate, max-age=0`, `Pragma: no-cache`, `Expires: 0`. ETag не выставляется, `304` не отдаётся — контент всегда приходит целиком. |
-| Остальные файлы | `ETag` + `Cache-Control: no-cache` — клиент кэширует, но каждый раз ревалидирует через `If-None-Match` и получает `304`, если файл не менялся. У исходного файла и у каждой его сжатой копии свой ETag. |
-| Папка (`/es/`, `/es`) → её `index.html` | Как обычный файл `/es/index.html`: `ETag` + `Cache-Control: no-cache`. `.disable-cache` проверяется и по пути запроса (`/es/`), и по пути файла (`/es/index.html`). |
-| SPA-роут (файла нет на диске) | Без `WITH_MOBILE` — как обычный файл (`ETag` + `no-cache`). При `WITH_MOBILE=1` — как `index.html`, то есть без кэша. |
+| `/`, `/index.html` and paths from `.disable-cache` | `Cache-Control: no-store, no-cache, must-revalidate, max-age=0`, `Pragma: no-cache`, `Expires: 0`. No ETag is set and `304` is never returned — the content always comes in full. |
+| Other files | `ETag` + `Cache-Control: no-cache` — the client caches the file, but revalidates it every time via `If-None-Match` and gets `304` if the file has not changed. The original file and each of its compressed copies have their own ETag. |
+| Folder (`/es/`, `/es`) → its `index.html` | Same as the regular file `/es/index.html`: `ETag` + `Cache-Control: no-cache`. `.disable-cache` is checked by both the request path (`/es/`) and the file path (`/es/index.html`). |
+| SPA route (no such file) | Without `WITH_MOBILE` — as a regular file (`ETag` + `no-cache`). With `WITH_MOBILE=1` — as `index.html`, i.e. not cached. |
 
-## Поведение по умолчанию
+## Default behavior
 
-- TCP: `0.0.0.0:8000` (захардкожено).
-- Static files: папка `./wwwroot`, ETag включён. При старте создаются сжатые копии `br` и `gzip` в `$HOME/wwwroot-br` и `$HOME/wwwroot-gzip`.
+- TCP: `0.0.0.0:8000` (hardcoded).
+- Static files: the `./wwwroot` folder, ETag enabled. At startup the `br` and `gzip` copies are created in `$HOME/wwwroot-br` and `$HOME/wwwroot-gzip`.
 - Index / not-found: `index.html`.
-- Папка → её `index.html`. Если путь оканчивается на `/` или на диске это каталог, отдаётся `index.html` из этой папки: `/es/` и `/es` → `./wwwroot/es/index.html`, `/es/legal/` → `./wwwroot/es/legal/index.html`. Дальше он обрабатывается как файл `/es/index.html`: `Content-Type` по нему (`text/html`), `ETag` и кэш — как у обычного файла, `FILE_TO_VERSION_INJECTION` сравнивается с этим путём. Редиректа `/es` → `/es/` нет, поэтому относительные ссылки на странице, открытой по `/es`, браузер разрешает от `/`. В многостраничном сайте используйте абсолютные ссылки или ссылки на папки со слешем в конце.
-- Если в папке нет `index.html` (или папки нет вовсе) — SPA-fallback на корневой `/index.html`. `/` и `/index.html` — корневой index без кэша.
-- Пути с сегментами `.` и `..` или с `\` на диске не ищутся и отдают корневой `index.html` как SPA-роут — за пределы корневой папки запрос не выходит.
-- Middlewares (в порядке регистрации): `IsAliveMiddleware`, `NoRobotsMiddleware` (при `NO_ROBOTS=true`), `BasicAuthMiddleware` (при заданном `BASIC-AUTH`), `RequestFlowMiddleware`.
-- `RequestFlowMiddleware` разводит обработку на два flow: `handle_no_mobile` (по умолчанию) и `handle_with_mobile` (при `WITH_MOBILE=1`).
+- Folder → its `index.html`. If the path ends with `/` or points to a folder, the `index.html` of that folder is served: `/es/` and `/es` → `./wwwroot/es/index.html`, `/es/legal/` → `./wwwroot/es/legal/index.html`. It is then handled as the file `/es/index.html`: `Content-Type` is taken from it (`text/html`), ETag and caching are the same as for a regular file, and `FILE_TO_VERSION_INJECTION` is compared with this path. There is no `/es` → `/es/` redirect, so on a page opened at `/es` the browser resolves relative links from `/`. In a multi-page site use absolute links or links to folders with a trailing slash.
+- If the folder has no `index.html` (or there is no such folder at all) — SPA fallback to the root `/index.html`. `/` and `/index.html` are the root index, not cached.
+- Paths with `.` or `..` segments or with `\` — including the percent-encoded ones (`%2e`, `%2f`, `%5c`) — are rejected with `403 Forbidden`: a request never leads out of the root folder.
+- Middlewares (in the order of registration): `IsAliveMiddleware`, `NoRobotsMiddleware` (with `NO_ROBOTS=true`), `BasicAuthMiddleware` (when `BASIC-AUTH` is set), `RequestFlowMiddleware`.
+- `RequestFlowMiddleware` splits the handling into two flows: `handle_no_mobile` (default) and `handle_with_mobile` (with `WITH_MOBILE=1`).
 
-## Пример запуска
+## Run example
 
 ```bash
 env 'BASIC-AUTH=my-password' \
