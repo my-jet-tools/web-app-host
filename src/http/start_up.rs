@@ -3,8 +3,9 @@ use std::{net::SocketAddr, sync::Arc};
 use is_alive_middleware::IsAliveMiddleware;
 use my_http_server::MyHttpServer;
 
-use crate::static_files::{
-    CompressionAlgorithm, CompressionLevel, CompressionSettings, StaticFilesReader,
+use crate::{
+    models::{DESKTOP_FOLDER, MOBILE_FOLDER},
+    static_files::{compile_copies_folders, CompressionAlgorithm, ContentFiles, StaticFilesReader},
 };
 
 pub async fn setup_server(
@@ -59,23 +60,8 @@ pub async fn setup_server(
         println!("WITH_MOBILE=1 — serving content from the desktop and the mobile folders");
     }
 
-    let compression = get_compression_settings();
-
-    if files_caching_enabled() {
-        println!(
-            "Cached files are compressed with {} — {:?} compression level",
-            compression.algorithm.as_str(),
-            compression.level
-        );
-    } else {
-        println!("FILES_CACHING_DISABLED=1 — in-memory files caching is disabled");
-    }
-
-    let static_files = StaticFilesReader::new(
-        files_caching_enabled(),
-        compression,
-        get_disable_cache_list().await,
-    );
+    let static_files =
+        StaticFilesReader::new(create_content_files().await, get_disable_cache_list().await);
 
     let request_flow_middleware = Arc::new(super::RequestFlowMiddleware::new(static_files));
 
@@ -100,37 +86,75 @@ pub async fn setup_server(
     }
 }
 
-fn files_caching_enabled() -> bool {
-    match std::env::var("FILES_CACHING_DISABLED") {
-        Ok(value) => value.trim() != "1",
-        Err(_) => true,
+/// Scans the content and creates its compressed copies in the home folder. They are compressed
+/// with the maximum level - it takes time, so the server is started when they are ready
+async fn create_content_files() -> ContentFiles {
+    let copies_folders = match get_home_folder() {
+        Some(home) => compile_copies_folders(home.as_str()),
+        None => {
+            println!("HOME is not set — compressed copies of the content are not created, files are served uncompressed");
+            vec![]
+        }
+    };
+
+    for folder in copies_folders.iter() {
+        println!(
+            "Creating the {} copies of the content in '{}'",
+            folder.algorithm.as_str(),
+            folder.path
+        );
     }
+
+    let started = std::time::Instant::now();
+
+    let content_files = tokio::task::spawn_blocking(move || {
+        // in WITH_MOBILE mode only the device folders are served - each with its own copies
+        let site_folders: &[&str] = if crate::app::APP_CTX.with_mobile {
+            &[DESKTOP_FOLDER, MOBILE_FOLDER]
+        } else {
+            &[""]
+        };
+
+        ContentFiles::create(
+            crate::app::APP_CTX.www_root.as_str(),
+            site_folders,
+            copies_folders.as_slice(),
+        )
+    })
+    .await
+    .expect("Scanning of the content has panicked");
+
+    let copies: Vec<String> = CompressionAlgorithm::ALL
+        .into_iter()
+        .map(|algorithm| {
+            format!(
+                "{} {} copies",
+                content_files.copies_count(algorithm),
+                algorithm.as_str()
+            )
+        })
+        .collect();
+
+    println!(
+        "Content of '{}' is ready in {:.1?}: {} files, {}",
+        crate::app::APP_CTX.www_root,
+        started.elapsed(),
+        content_files.files_count(),
+        copies.join(", ")
+    );
+
+    content_files
 }
 
-/// Unsupported algorithm is the mistake of the configuration - the service does not start with it
-fn get_compression_settings() -> CompressionSettings {
-    let mut result = CompressionSettings::default();
+fn get_home_folder() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let home = home.trim();
 
-    if let Ok(value) = std::env::var("COMPRESSION_ALGORITHM") {
-        if !value.trim().is_empty() {
-            result.algorithm = CompressionAlgorithm::parse(value.as_str()).unwrap_or_else(|| {
-                panic!(
-                    "COMPRESSION_ALGORITHM='{}' is not supported. Supported values: zstd, br, gzip, deflate",
-                    value
-                )
-            });
-        }
+    if home.is_empty() {
+        return None;
     }
 
-    if let Ok(value) = std::env::var("MAX_COMPRESSION") {
-        let value = value.trim();
-
-        if value == "1" || value.eq_ignore_ascii_case("true") {
-            result.level = CompressionLevel::Max;
-        }
-    }
-
-    result
+    Some(home.to_string())
 }
 
 async fn get_disable_cache_list() -> Vec<String> {

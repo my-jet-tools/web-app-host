@@ -3,12 +3,13 @@ use my_http_server::{HttpFailResult, HttpOkResult, HttpOutput, WebContentType};
 use crate::static_files::{apply_cache_headers, compile_error, FoundFile};
 
 /// Replaces the version placeholders in the content of the file we have found.
-/// The result is compiled per request - so it is never cached
-pub fn inject_version(
-    found_file: &FoundFile,
+/// The placeholders are in the raw file - so it is sent uncompressed, whatever the client
+/// accepts. The result is compiled per request - so it is never cached
+pub async fn inject_version(
+    found_file: &FoundFile<'_>,
     vary_by_user_agent: bool,
 ) -> Option<Result<HttpOkResult, HttpFailResult>> {
-    let content = match found_file.content.get_raw() {
+    let content = match tokio::fs::read(found_file.file.raw.path.as_str()).await {
         Ok(content) => content,
         Err(err) => return Some(Err(compile_error(found_file.uri_path.as_str(), err))),
     };

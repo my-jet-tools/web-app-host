@@ -19,13 +19,13 @@ pub async fn handle_with_mobile(
         vary_by_user_agent: true,
     };
 
-    let found_file = static_files
-        .find_file(ctx.request.http_path.as_str(), params.folders)
-        .await?;
+    let found_file = static_files.find_file(ctx.request.http_path.as_str(), params.folders)?;
 
     if crate::app::APP_CTX.has_to_inject_version(found_file.uri_path.as_str()) {
-        return crate::scripts::inject_version(&found_file, params.vary_by_user_agent);
+        return crate::scripts::inject_version(&found_file, params.vary_by_user_agent).await;
     }
 
-    static_files.compile_response(ctx, &found_file, &params)
+    static_files
+        .compile_response(ctx, &found_file, &params)
+        .await
 }

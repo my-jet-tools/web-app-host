@@ -21,7 +21,6 @@ lazy_static = "*"
 base64 = "*"
 sha2 = "*"
 flate2 = "*"
-zstd = "*"
 brotli = "*"
 
 tokio = { version = "*", features = ["full"] }

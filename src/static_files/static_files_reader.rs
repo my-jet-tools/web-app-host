@@ -6,8 +6,8 @@ use my_http_server::{
 use crate::models::INDEX_FILE;
 
 use super::{
-    compile_folder_index_path, is_safe_uri_path, AcceptedEncodings, CompressionSettings,
-    FilesAccess, FoundFile, NoCache, ServeParams,
+    compile_folder_index_path, is_safe_uri_path, AcceptedEncodings, ContentFiles, FoundFile,
+    NoCache, ServeParams,
 };
 
 /// Full set of headers which forbids any caching of the content
@@ -19,18 +19,14 @@ const NO_CACHE_EXPIRES: &str = "0";
 /// it comes with each request, since in WITH_MOBILE mode it is either the desktop
 /// or the mobile folder
 pub struct StaticFilesReader {
-    files_access: FilesAccess,
+    content_files: ContentFiles,
     no_cache: NoCache,
 }
 
 impl StaticFilesReader {
-    pub fn new(
-        enable_files_caching: bool,
-        compression: CompressionSettings,
-        no_cache_paths: Vec<String>,
-    ) -> Self {
+    pub fn new(content_files: ContentFiles, no_cache_paths: Vec<String>) -> Self {
         Self {
-            files_access: FilesAccess::new(enable_files_caching, compression),
+            content_files,
             no_cache: NoCache::new(no_cache_paths),
         }
     }
@@ -38,54 +34,57 @@ impl StaticFilesReader {
     /// Looks the file up in the folders - in the given order. If the path points to the folder -
     /// its index file is served. If it is nowhere - the index file of the first folder
     /// renders the SPA route
-    pub async fn find_file(&self, uri_path: &str, folders: &[&str]) -> Option<FoundFile> {
+    pub fn find_file(&self, uri_path: &str, folders: &[&str]) -> Option<FoundFile<'_>> {
         // path which leads out of the root folder is rejected by the middleware as forbidden.
         // If it gets here anyway - it is never looked up
         if is_safe_uri_path(uri_path) {
             for folder in folders {
-                if let Some(found_file) = self.find_in_folder(folder, uri_path).await {
+                if let Some(found_file) = self.find_in_folder(folder, uri_path) {
                     return Some(found_file);
                 }
             }
         }
 
-        let content = self.files_access.get(folders.first()?, INDEX_FILE).await?;
+        let file = self.content_files.get(folders.first()?, INDEX_FILE)?;
 
-        Some(FoundFile::as_index_file(content))
+        Some(FoundFile::as_index_file(file))
     }
 
     /// Path which ends with '/' points to the folder. Path without it points to the file -
     /// or to the folder, if there is no such file
-    async fn find_in_folder(&self, folder: &str, uri_path: &str) -> Option<FoundFile> {
+    fn find_in_folder(&self, folder: &str, uri_path: &str) -> Option<FoundFile<'_>> {
         if !uri_path.ends_with('/') {
-            if let Some(content) = self.files_access.get(folder, uri_path).await {
-                return Some(FoundFile::as_requested(content, uri_path.to_string()));
+            if let Some(file) = self.content_files.get(folder, uri_path) {
+                return Some(FoundFile::as_requested(file, uri_path.to_string()));
             }
         }
 
         // the index file exists only if the path is the folder on the disk
         let index_path = compile_folder_index_path(uri_path);
-        let content = self.files_access.get(folder, index_path.as_str()).await?;
+        let file = self.content_files.get(folder, index_path.as_str())?;
 
-        Some(FoundFile::as_requested(content, index_path))
+        Some(FoundFile::as_requested(file, index_path))
     }
 
-    pub fn compile_response(
+    /// Sends the variant of the file the client accepts: the compressed copy - or the raw file.
+    /// Each variant has its own etag
+    pub async fn compile_response(
         &self,
         ctx: &HttpContext,
-        found_file: &FoundFile,
+        found_file: &FoundFile<'_>,
         params: &ServeParams<'_>,
     ) -> Option<Result<HttpOkResult, HttpFailResult>> {
         let disable_caching = self.has_to_disable_caching(&ctx.request.http_path, found_file);
+
+        let (variant, encoding) = found_file
+            .file
+            .choose_variant(AcceptedEncodings::from_request(ctx));
 
         // etag makes no sense for the content the client is not allowed to store
         let etag = if disable_caching {
             None
         } else {
-            match found_file.content.get_etag() {
-                Ok(etag) => Some(etag),
-                Err(err) => return Some(Err(compile_error(found_file.uri_path.as_str(), err))),
-            }
+            Some(variant.etag.clone())
         };
 
         if let Some(etag) = etag.as_ref() {
@@ -94,11 +93,8 @@ impl StaticFilesReader {
             }
         }
 
-        let (body, encoding) = match found_file
-            .content
-            .compile_body(AcceptedEncodings::from_request(ctx))
-        {
-            Ok(result) => result,
+        let body = match tokio::fs::read(variant.path.as_str()).await {
+            Ok(body) => body,
             Err(err) => return Some(Err(compile_error(found_file.uri_path.as_str(), err))),
         };
 
@@ -110,8 +106,8 @@ impl StaticFilesReader {
 
         builder = apply_cache_headers(builder, etag, params.vary_by_user_agent);
 
-        if let Some(encoding) = encoding.header_value() {
-            builder = builder.add_header("Content-Encoding", encoding);
+        if let Some(algorithm) = encoding {
+            builder = builder.add_header("Content-Encoding", algorithm.as_str());
         }
 
         Some(builder.set_content(body).into_ok_result(false))
@@ -119,7 +115,7 @@ impl StaticFilesReader {
 
     /// Index file of the folder is served as the file itself - so the no-cache list
     /// is checked by both paths: the requested one and the one of the file
-    fn has_to_disable_caching(&self, request_path: &HttpPath, found_file: &FoundFile) -> bool {
+    fn has_to_disable_caching(&self, request_path: &HttpPath, found_file: &FoundFile<'_>) -> bool {
         if found_file.is_index_file || self.no_cache.marked_as_no_cache(request_path) {
             return true;
         }
@@ -181,55 +177,27 @@ fn has_the_same_etag(ctx: &HttpContext, etag: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::CachedContent;
+    use super::super::{ContentFile, FileVariant, TestFolder};
     use super::*;
 
-    /// Folder with the files of the test. It is removed when the test is over
-    struct TestFolder {
-        path: std::path::PathBuf,
+    /// File the reader has found - with the content of its raw file
+    struct Found {
+        uri_path: String,
+        content: String,
+        is_index_file: bool,
     }
 
-    impl TestFolder {
-        fn new(test_name: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "web-app-host-{}-{}",
-                test_name,
-                std::process::id()
-            ));
+    /// Looks the file up in the content of the test site - its 'wwwroot' folder
+    fn find_file(site: &TestFolder, folders: &[&str], uri_path: &str) -> Found {
+        let content_files = ContentFiles::create(site.get_folder("wwwroot").as_str(), &[""], &[]);
+        let reader = StaticFilesReader::new(content_files, vec![]);
+        let found_file = reader.find_file(uri_path, folders).unwrap();
 
-            let _ = std::fs::remove_dir_all(&path);
-            std::fs::create_dir_all(&path).unwrap();
-
-            Self { path }
+        Found {
+            content: std::fs::read_to_string(found_file.file.raw.path.as_str()).unwrap(),
+            uri_path: found_file.uri_path,
+            is_index_file: found_file.is_index_file,
         }
-
-        fn add_file(&self, file_name: &str, content: &str) -> &Self {
-            let file_name = self.path.join(file_name);
-            std::fs::create_dir_all(file_name.parent().unwrap()).unwrap();
-            std::fs::write(file_name, content).unwrap();
-            self
-        }
-
-        fn get_folder(&self, name: &str) -> String {
-            self.path.join(name).to_str().unwrap().to_string()
-        }
-    }
-
-    impl Drop for TestFolder {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
-
-    async fn find_file(folders: &[&str], uri_path: &str) -> FoundFile {
-        StaticFilesReader::new(true, CompressionSettings::default(), vec![])
-            .find_file(uri_path, folders)
-            .await
-            .unwrap()
-    }
-
-    fn get_content(found_file: &FoundFile) -> String {
-        String::from_utf8(found_file.content.get_raw().unwrap()).unwrap()
     }
 
     fn create_test_site(test_name: &str) -> TestFolder {
@@ -245,71 +213,71 @@ mod tests {
         result
     }
 
-    #[tokio::test]
-    async fn serves_the_index_file_of_the_folder() {
+    #[test]
+    fn serves_the_index_file_of_the_folder() {
         let site = create_test_site("folder-index");
         let www_root = site.get_folder("wwwroot");
 
         for uri_path in ["/es/", "/es"] {
-            let found_file = find_file(&[www_root.as_str()], uri_path).await;
+            let found_file = find_file(&site, &[www_root.as_str()], uri_path);
 
             assert_eq!(found_file.uri_path, "/es/index.html", "{}", uri_path);
-            assert_eq!(get_content(&found_file), "es", "{}", uri_path);
+            assert_eq!(found_file.content, "es", "{}", uri_path);
             assert!(!found_file.is_index_file, "{}", uri_path);
         }
 
         for uri_path in ["/es/legal/", "/es/legal"] {
-            let found_file = find_file(&[www_root.as_str()], uri_path).await;
+            let found_file = find_file(&site, &[www_root.as_str()], uri_path);
 
             assert_eq!(found_file.uri_path, "/es/legal/index.html", "{}", uri_path);
-            assert_eq!(get_content(&found_file), "es-legal", "{}", uri_path);
+            assert_eq!(found_file.content, "es-legal", "{}", uri_path);
         }
     }
 
-    #[tokio::test]
-    async fn serves_the_files_as_before() {
+    #[test]
+    fn serves_the_files_as_before() {
         let site = create_test_site("files");
         let www_root = site.get_folder("wwwroot");
 
-        let found_file = find_file(&[www_root.as_str()], "/es/app.js").await;
+        let found_file = find_file(&site, &[www_root.as_str()], "/es/app.js");
         assert_eq!(found_file.uri_path, "/es/app.js");
-        assert_eq!(get_content(&found_file), "es-app");
+        assert_eq!(found_file.content, "es-app");
 
-        let found_file = find_file(&[www_root.as_str()], "/es/index.html").await;
+        let found_file = find_file(&site, &[www_root.as_str()], "/es/index.html");
         assert_eq!(found_file.uri_path, "/es/index.html");
-        assert_eq!(get_content(&found_file), "es");
+        assert_eq!(found_file.content, "es");
     }
 
-    #[tokio::test]
-    async fn serves_the_root_index_file() {
+    #[test]
+    fn serves_the_root_index_file() {
         let site = create_test_site("root-index");
         let www_root = site.get_folder("wwwroot");
 
         for uri_path in ["/", "/index.html"] {
-            let found_file = find_file(&[www_root.as_str()], uri_path).await;
+            let found_file = find_file(&site, &[www_root.as_str()], uri_path);
 
             assert_eq!(found_file.uri_path, INDEX_FILE, "{}", uri_path);
-            assert_eq!(get_content(&found_file), "root", "{}", uri_path);
+            assert_eq!(found_file.content, "root", "{}", uri_path);
             assert!(found_file.is_index_file, "{}", uri_path);
         }
     }
 
-    #[tokio::test]
-    async fn renders_the_spa_route_if_there_is_no_folder_index_file() {
+    #[test]
+    fn renders_the_spa_route_if_there_is_no_folder_index_file() {
         let site = create_test_site("spa-route");
         let www_root = site.get_folder("wwwroot");
 
         for uri_path in ["/nope/", "/nope", "/es/nope/", "/assets/", "/assets"] {
-            let found_file = find_file(&[www_root.as_str()], uri_path).await;
+            let found_file = find_file(&site, &[www_root.as_str()], uri_path);
 
             assert_eq!(found_file.uri_path, INDEX_FILE, "{}", uri_path);
-            assert_eq!(get_content(&found_file), "root", "{}", uri_path);
+            assert_eq!(found_file.content, "root", "{}", uri_path);
             assert!(found_file.is_index_file, "{}", uri_path);
         }
     }
 
-    #[tokio::test]
-    async fn looks_the_folder_up_in_the_device_folder_first() {
+    #[test]
+    fn looks_the_folder_up_in_the_device_folder_first() {
         let site = TestFolder::new("with-mobile");
 
         site.add_file("wwwroot/mobile/index.html", "mobile")
@@ -325,30 +293,30 @@ mod tests {
         let folders = [mobile.as_str(), desktop.as_str()];
 
         for uri_path in ["/es/", "/es"] {
-            let found_file = find_file(&folders, uri_path).await;
+            let found_file = find_file(&site, &folders, uri_path);
             assert_eq!(found_file.uri_path, "/es/index.html", "{}", uri_path);
-            assert_eq!(get_content(&found_file), "mobile-es", "{}", uri_path);
+            assert_eq!(found_file.content, "mobile-es", "{}", uri_path);
         }
 
         // there is no such folder in the device folder
         for uri_path in ["/de/", "/de"] {
-            let found_file = find_file(&folders, uri_path).await;
+            let found_file = find_file(&site, &folders, uri_path);
             assert_eq!(found_file.uri_path, "/de/index.html", "{}", uri_path);
-            assert_eq!(get_content(&found_file), "desktop-de", "{}", uri_path);
+            assert_eq!(found_file.content, "desktop-de", "{}", uri_path);
         }
 
         // folder of the device has no index file
-        let found_file = find_file(&folders, "/fr/").await;
+        let found_file = find_file(&site, &folders, "/fr/");
         assert_eq!(found_file.uri_path, "/fr/index.html");
-        assert_eq!(get_content(&found_file), "desktop-fr");
+        assert_eq!(found_file.content, "desktop-fr");
 
-        let found_file = find_file(&folders, "/nope/").await;
+        let found_file = find_file(&site, &folders, "/nope/");
         assert_eq!(found_file.uri_path, INDEX_FILE);
-        assert_eq!(get_content(&found_file), "mobile");
+        assert_eq!(found_file.content, "mobile");
     }
 
-    #[tokio::test]
-    async fn does_not_lead_out_of_the_root_folder() {
+    #[test]
+    fn does_not_lead_out_of_the_root_folder() {
         let site = create_test_site("out-of-root");
         site.add_file("secret.txt", "secret")
             .add_file("private/index.html", "private");
@@ -362,30 +330,27 @@ mod tests {
             "/../private",
             "/es/../../private/",
         ] {
-            let found_file = find_file(&[www_root.as_str()], uri_path).await;
+            let found_file = find_file(&site, &[www_root.as_str()], uri_path);
 
             assert_eq!(found_file.uri_path, INDEX_FILE, "{}", uri_path);
-            assert_eq!(get_content(&found_file), "root", "{}", uri_path);
+            assert_eq!(found_file.content, "root", "{}", uri_path);
         }
-    }
-
-    fn create_found_file(uri_path: &str) -> FoundFile {
-        let content = CachedContent {
-            data: vec![],
-            compression: None,
-            etag: None,
-        };
-
-        FoundFile::as_requested(content, uri_path.to_string())
     }
 
     fn has_to_disable_caching(no_cache: &[&str], request_path: &str, uri_path: &str) -> bool {
         let no_cache = no_cache.iter().map(|itm| itm.to_string()).collect();
 
-        StaticFilesReader::new(true, CompressionSettings::default(), no_cache)
-            .has_to_disable_caching(
+        let file = ContentFile {
+            raw: FileVariant {
+                path: String::new(),
+                etag: String::new(),
+            },
+            copies: vec![],
+        };
+
+        StaticFilesReader::new(ContentFiles::default(), no_cache).has_to_disable_caching(
             &HttpPath::from_str(request_path),
-            &create_found_file(uri_path),
+            &FoundFile::as_requested(&file, uri_path.to_string()),
         )
     }
 

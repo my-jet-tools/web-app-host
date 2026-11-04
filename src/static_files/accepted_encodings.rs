@@ -5,10 +5,8 @@ use super::CompressionAlgorithm;
 /// Encodings the client is ready to accept
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AcceptedEncodings {
-    pub zstd: bool,
     pub brotli: bool,
     pub gzip: bool,
-    pub deflate: bool,
 }
 
 impl AcceptedEncodings {
@@ -30,10 +28,8 @@ impl AcceptedEncodings {
 
     pub fn accepts(&self, algorithm: CompressionAlgorithm) -> bool {
         match algorithm {
-            CompressionAlgorithm::Zstd => self.zstd,
             CompressionAlgorithm::Brotli => self.brotli,
             CompressionAlgorithm::Gzip => self.gzip,
-            CompressionAlgorithm::Deflate => self.deflate,
         }
     }
 
@@ -41,25 +37,37 @@ impl AcceptedEncodings {
         let mut result = Self::default();
 
         for token in header_value.split(',') {
-            let token = token.trim();
+            let mut parts = token.split(';');
+            let name = parts.next().unwrap_or_default().trim();
 
-            let name = match token.split(';').next() {
-                Some(name) => name.trim(),
-                None => token,
-            };
+            // 'q=0' means the client refuses the encoding
+            if parts.any(is_zero_quality) {
+                continue;
+            }
 
-            if name.eq_ignore_ascii_case("zstd") {
-                result.zstd = true;
-            } else if name.eq_ignore_ascii_case("br") {
+            if name.eq_ignore_ascii_case("br") {
                 result.brotli = true;
-            } else if name.eq_ignore_ascii_case("gzip") {
+            } else if name.eq_ignore_ascii_case("gzip") || name.eq_ignore_ascii_case("x-gzip") {
                 result.gzip = true;
-            } else if name.eq_ignore_ascii_case("deflate") {
-                result.deflate = true;
             }
         }
 
         result
+    }
+}
+
+fn is_zero_quality(param: &str) -> bool {
+    let Some((name, value)) = param.split_once('=') else {
+        return false;
+    };
+
+    if !name.trim().eq_ignore_ascii_case("q") {
+        return false;
+    }
+
+    match value.trim().parse::<f64>() {
+        Ok(quality) => quality <= 0.0,
+        Err(_) => false,
     }
 }
 
@@ -68,43 +76,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_zstd() {
-        let result = AcceptedEncodings::parse("zstd");
-        assert!(result.zstd);
-        assert!(!result.deflate);
+    fn parses_brotli_and_gzip() {
+        let result = AcceptedEncodings::parse("gzip, deflate, br, zstd");
+        assert!(result.accepts(CompressionAlgorithm::Brotli));
+        assert!(result.accepts(CompressionAlgorithm::Gzip));
     }
 
     #[test]
-    fn parses_both() {
-        let result = AcceptedEncodings::parse("zstd, deflate, br");
-        assert!(result.zstd);
-        assert!(result.deflate);
+    fn respects_the_case_and_the_quality() {
+        let result = AcceptedEncodings::parse("BR;q=1.0, GZip;q=0.5");
+        assert!(result.brotli);
+        assert!(result.gzip);
+
+        let result = AcceptedEncodings::parse("x-gzip");
+        assert!(!result.brotli);
+        assert!(result.gzip);
     }
 
     #[test]
-    fn respects_case_and_qvalues() {
-        let result = AcceptedEncodings::parse("Zstd;q=1.0, DEFLATE;q=0.5");
-        assert!(result.zstd);
-        assert!(result.deflate);
+    fn encoding_with_zero_quality_is_refused() {
+        let result = AcceptedEncodings::parse("br;q=0, gzip");
+        assert!(!result.brotli);
+        assert!(result.gzip);
+
+        let result = AcceptedEncodings::parse("br, gzip; Q = 0.000");
+        assert!(result.brotli);
+        assert!(!result.gzip);
+
+        let result = AcceptedEncodings::parse("br;q=0.001");
+        assert!(result.brotli);
     }
 
     #[test]
     fn is_not_confused_by_other_encodings() {
-        let result = AcceptedEncodings::parse("gzip, br");
-        assert!(!result.zstd);
-        assert!(!result.deflate);
-    }
+        let result = AcceptedEncodings::parse("deflate, zstd, identity");
+        assert!(!result.brotli);
+        assert!(!result.gzip);
 
-    #[test]
-    fn parses_brotli_and_gzip() {
-        let result = AcceptedEncodings::parse("gzip, deflate, br, zstd");
-        assert!(result.accepts(CompressionAlgorithm::Zstd));
-        assert!(result.accepts(CompressionAlgorithm::Brotli));
-        assert!(result.accepts(CompressionAlgorithm::Gzip));
-        assert!(result.accepts(CompressionAlgorithm::Deflate));
-
-        let result = AcceptedEncodings::parse("BR;q=1.0");
-        assert!(result.accepts(CompressionAlgorithm::Brotli));
-        assert!(!result.accepts(CompressionAlgorithm::Gzip));
+        let result = AcceptedEncodings::parse("");
+        assert!(!result.brotli);
+        assert!(!result.gzip);
     }
 }

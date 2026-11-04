@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use rust_extensions::AppStates;
 
+use crate::models::{DESKTOP_FOLDER, MOBILE_FOLDER};
+
 pub const DEFAULT_WWW_ROOT: &str = "./wwwroot";
 
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -47,8 +49,8 @@ impl AppContext {
             compile_time: get_compile_time(),
             file_to_inject: get_file_to_version_injection(),
             with_mobile: get_with_mobile(),
-            desktop_www_root: format!("{}/desktop", www_root),
-            mobile_www_root: format!("{}/mobile", www_root),
+            desktop_www_root: format!("{}{}", www_root, DESKTOP_FOLDER),
+            mobile_www_root: format!("{}{}", www_root, MOBILE_FOLDER),
             www_root,
             basic_auth_password: get_basic_auth_password(),
             no_robots: get_no_robots(),
