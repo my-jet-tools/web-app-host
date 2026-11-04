@@ -4,3 +4,5 @@ mod detect_device_folder;
 pub use detect_device_folder::*;
 mod inject_version;
 pub use inject_version::*;
+mod write_rejected_request_log;
+pub use write_rejected_request_log::*;

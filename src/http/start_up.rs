@@ -5,7 +5,9 @@ use my_http_server::MyHttpServer;
 
 use crate::{
     models::{DESKTOP_FOLDER, MOBILE_FOLDER},
-    static_files::{compile_copies_folders, CompressionAlgorithm, ContentFiles, StaticFilesReader},
+    static_files::{
+        compile_copies_folders, prepare_copies_folders, ContentFiles, StaticFilesReader,
+    },
 };
 
 pub async fn setup_server(
@@ -60,8 +62,15 @@ pub async fn setup_server(
         println!("WITH_MOBILE=1 — serving content from the desktop and the mobile folders");
     }
 
-    let static_files =
-        StaticFilesReader::new(create_content_files().await, get_disable_cache_list().await);
+    if crate::app::APP_CTX.allow_framing {
+        println!("ALLOW_FRAMING=true — the pages may be shown in the frames of the other sites");
+    }
+
+    let static_files = StaticFilesReader::new(
+        create_content_files().await,
+        crate::app::APP_CTX.compression_queue.clone(),
+        get_disable_cache_list().await,
+    );
 
     let request_flow_middleware = Arc::new(super::RequestFlowMiddleware::new(static_files));
 
@@ -86,8 +95,10 @@ pub async fn setup_server(
     }
 }
 
-/// Scans the content and creates its compressed copies in the home folder. They are compressed
-/// with the maximum level - it takes time, so the server is started when they are ready
+/// Scans the content and starts its preparation in the background: the files are read,
+/// given the etags and compressed with the maximum level one by one - so the compression takes
+/// one core, and the server starts right after the scan. The request for the file which
+/// is not prepared yet waits for it - the file goes to the head of the queue
 async fn create_content_files() -> ContentFiles {
     let copies_folders = match get_home_folder() {
         Some(home) => compile_copies_folders(home.as_str()),
@@ -97,6 +108,30 @@ async fn create_content_files() -> ContentFiles {
         }
     };
 
+    let started = std::time::Instant::now();
+
+    let (content_files, copies_folders) = tokio::task::spawn_blocking(move || {
+        // in WITH_MOBILE mode only the device folders are served - each with its own copies
+        let site_folders: &[&str] = if crate::app::APP_CTX.with_mobile {
+            &[DESKTOP_FOLDER, MOBILE_FOLDER]
+        } else {
+            &[""]
+        };
+
+        let content_files = ContentFiles::scan(crate::app::APP_CTX.www_root.as_str(), site_folders);
+
+        (content_files, prepare_copies_folders(copies_folders))
+    })
+    .await
+    .expect("Scanning of the content has panicked");
+
+    println!(
+        "Content of '{}' is scanned in {:.1?}: {} files — they are prepared in the background",
+        crate::app::APP_CTX.www_root,
+        started.elapsed(),
+        content_files.files_count()
+    );
+
     for folder in copies_folders.iter() {
         println!(
             "Creating the {} copies of the content in '{}'",
@@ -105,43 +140,9 @@ async fn create_content_files() -> ContentFiles {
         );
     }
 
-    let started = std::time::Instant::now();
-
-    let content_files = tokio::task::spawn_blocking(move || {
-        // in WITH_MOBILE mode only the device folders are served - each with its own copies
-        let site_folders: &[&str] = if crate::app::APP_CTX.with_mobile {
-            &[DESKTOP_FOLDER, MOBILE_FOLDER]
-        } else {
-            &[""]
-        };
-
-        ContentFiles::create(
-            crate::app::APP_CTX.www_root.as_str(),
-            site_folders,
-            copies_folders.as_slice(),
-        )
-    })
-    .await
-    .expect("Scanning of the content has panicked");
-
-    let copies: Vec<String> = CompressionAlgorithm::ALL
-        .into_iter()
-        .map(|algorithm| {
-            format!(
-                "{} {} copies",
-                content_files.copies_count(algorithm),
-                algorithm.as_str()
-            )
-        })
-        .collect();
-
-    println!(
-        "Content of '{}' is ready in {:.1?}: {} files, {}",
-        crate::app::APP_CTX.www_root,
-        started.elapsed(),
-        content_files.files_count(),
-        copies.join(", ")
-    );
+    let compression_queue = &crate::app::APP_CTX.compression_queue;
+    compression_queue.enqueue(content_files.files_by_size());
+    compression_queue.start(copies_folders);
 
     content_files
 }

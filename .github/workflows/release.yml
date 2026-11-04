@@ -3,6 +3,10 @@ on:
   push:
     tags: "*"
 
+# the image is pushed with PUBLISH_TOKEN - the token of the workflow only reads the repository
+permissions:
+  contents: read
+
 env:
   IMAGE_NAME: ghcr.io/my-jet-tools/web-app-host
 
@@ -10,27 +14,32 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
+      - uses: actions/checkout@v4
 
-      - name: Get the version
-        id: get_version
-        run: echo ::set-output name=VERSION::$(echo ${GITHUB_REF_NAME})
+      # rustup is preinstalled on the runner - no third party action is needed
+      - name: Install the Rust toolchain
+        run: rustup update stable && rustup default stable
 
+      # the tag comes through the environment, not through the template:
+      # it is never parsed as a part of the script
       - name: Updating version
-        run: sed -i -e 's/^version = .*/version = "${{ steps.get_version.outputs.VERSION }}"/' Cargo.toml
+        run: sed -i -e "s/^version = .*/version = \"${GITHUB_REF_NAME}\"/" Cargo.toml
 
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v1      
-              
+      # a dependency with a known vulnerability does not get into the image
+      - name: Audit the dependencies
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
+
+      # the versions of the dependencies are taken from the committed Cargo.lock
       - run: cargo build --release
 
       - name: Docker login
-        run: |
-          echo "${{ secrets.PUBLISH_TOKEN }}" | docker login https://ghcr.io -u "${{ github.actor }}" --password-stdin
+        env:
+          PUBLISH_TOKEN: ${{ secrets.PUBLISH_TOKEN }}
+        run: echo "${PUBLISH_TOKEN}" | docker login https://ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+
       - name: Docker Build and Publish
-        run: |          
-          docker build -t ${IMAGE_NAME}:${{ steps.get_version.outputs.VERSION }} .
-          docker push ${IMAGE_NAME}:${{ steps.get_version.outputs.VERSION }}          
+        run: |
+          docker build -t "${IMAGE_NAME}:${GITHUB_REF_NAME}" .
+          docker push "${IMAGE_NAME}:${GITHUB_REF_NAME}"

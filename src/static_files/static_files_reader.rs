@@ -1,32 +1,53 @@
+use std::{sync::Arc, time::Duration};
+
 use my_http_server::{
-    HttpContext, HttpFailResult, HttpOkResult, HttpOutput, HttpPath, HttpRequestHeaders,
-    HttpResultBuilder, WebContentType,
+    HttpContext, HttpFailResult, HttpOkResult, HttpOutput, HttpOutputAsStream, HttpPath,
+    HttpResultBuilder,
 };
 
 use crate::models::INDEX_FILE;
 
 use super::{
-    compile_folder_index_path, is_safe_uri_path, AcceptedEncodings, ContentFiles, FoundFile,
-    NoCache, ServeParams,
+    compile_folder_index_path, detect_content_type, is_safe_uri_path, send_chunks,
+    AcceptedEncodings, CompressionAlgorithm, CompressionQueue, ContentFile, ContentFiles,
+    FileChunks, FileVariant, FoundFile, NoCache, ServeParams, VariantChoice, STREAM_QUEUE_SIZE,
+    WHOLE_FILE_MAX_SIZE,
 };
+
+/// How often the request checks whether the file it waits for is prepared
+const PREPARED_FILE_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Full set of headers which forbids any caching of the content
 const NO_CACHE_CACHE_CONTROL: &str = "no-store, no-cache, must-revalidate, max-age=0";
 const NO_CACHE_PRAGMA: &str = "no-cache";
 const NO_CACHE_EXPIRES: &str = "0";
 
+/// The browser must not guess the type of the file by its content - it takes the one we send
+const NOSNIFF_HEADER: (&str, &str) = ("X-Content-Type-Options", "nosniff");
+/// The other sites get the origin of the page only - not its full url
+const REFERRER_POLICY_HEADER: (&str, &str) = ("Referrer-Policy", "strict-origin-when-cross-origin");
+/// Only the pages of the same site may show the page in a frame
+const FRAME_OPTIONS_HEADER: (&str, &str) = ("X-Frame-Options", "SAMEORIGIN");
+
 /// Serves the content of the root folder. The root folder is not a setting of the reader -
 /// it comes with each request, since in WITH_MOBILE mode it is either the desktop
 /// or the mobile folder
 pub struct StaticFilesReader {
     content_files: ContentFiles,
+    /// Prepares the files in the background - the request puts the file it waits for into it
+    compression_queue: Arc<CompressionQueue>,
     no_cache: NoCache,
 }
 
 impl StaticFilesReader {
-    pub fn new(content_files: ContentFiles, no_cache_paths: Vec<String>) -> Self {
+    pub fn new(
+        content_files: ContentFiles,
+        compression_queue: Arc<CompressionQueue>,
+        no_cache_paths: Vec<String>,
+    ) -> Self {
         Self {
             content_files,
+            compression_queue,
             no_cache: NoCache::new(no_cache_paths),
         }
     }
@@ -76,9 +97,12 @@ impl StaticFilesReader {
     ) -> Option<Result<HttpOkResult, HttpFailResult>> {
         let disable_caching = self.has_to_disable_caching(&ctx.request.http_path, found_file);
 
-        let (variant, encoding) = found_file
-            .file
-            .choose_variant(AcceptedEncodings::from_request(ctx));
+        let accepted = AcceptedEncodings::from_request(ctx);
+
+        let (variant, encoding) = match self.wait_for_variant(found_file.file, accepted).await {
+            Ok(result) => result,
+            Err(err) => return Some(Err(compile_error(found_file.uri_path.as_str(), err))),
+        };
 
         // etag makes no sense for the content the client is not allowed to store
         let etag = if disable_caching {
@@ -88,28 +112,82 @@ impl StaticFilesReader {
         };
 
         if let Some(etag) = etag.as_ref() {
-            if has_the_same_etag(ctx, etag.as_str()) {
-                return Some(HttpOutput::as_not_modified().into_ok_result(false));
+            // the library reads every 'If-None-Match' line as one list: '*', weak etags,
+            // and the etags of the previous versions which were sent without the quotes
+            if ctx.request.if_none_match_matches(etag.as_str()) {
+                // 304 carries the caching headers the 200 would have - the client and the caches
+                // in the middle refresh the response they keep with them
+                let builder = apply_cache_headers(
+                    HttpOutput::as_not_modified(),
+                    Some(etag.clone()),
+                    compile_vary(true, params.vary_by_user_agent),
+                );
+
+                return Some(builder.into_ok_result(false));
             }
         }
 
-        let body = match tokio::fs::read(variant.path.as_str()).await {
-            Ok(body) => body,
+        let content_type = detect_content_type(found_file.uri_path.as_str());
+
+        if variant.size <= WHOLE_FILE_MAX_SIZE {
+            let body = match tokio::fs::read(variant.path.as_str()).await {
+                Ok(body) => body,
+                Err(err) => return Some(Err(compile_error(found_file.uri_path.as_str(), err))),
+            };
+
+            let builder = HttpOutput::from_builder().set_content_type_opt(content_type);
+            let builder = apply_variant_headers(builder, etag, encoding, params);
+
+            return Some(builder.set_content(body).into_ok_result(false));
+        }
+
+        // the bigger file is sent by the chunks - so the request does not take the memory
+        // of the whole file
+        let chunks = match FileChunks::open(variant.path.as_str()).await {
+            Ok(chunks) => chunks,
             Err(err) => return Some(Err(compile_error(found_file.uri_path.as_str(), err))),
         };
 
-        let builder = HttpOutput::from_builder().set_content_type_opt(
-            WebContentType::detect_by_extension(found_file.uri_path.as_str()),
-        );
+        let (stream, producer) = HttpOutput::as_stream(STREAM_QUEUE_SIZE);
 
-        let mut builder =
-            apply_cache_headers(builder, etag, compile_vary(true, params.vary_by_user_agent));
+        let mut stream = stream.with_header("Content-Length", chunks.content_length().to_string());
 
-        if let Some(algorithm) = encoding {
-            builder = builder.add_header("Content-Encoding", algorithm.as_str());
+        if let Some(content_type) = content_type {
+            stream = stream.with_header("Content-Type", content_type.as_str());
         }
 
-        Some(builder.set_content(body).into_ok_result(false))
+        let stream = apply_variant_headers(stream, etag, encoding, params);
+
+        tokio::spawn(send_chunks(chunks, producer));
+
+        Some(stream.get_result())
+    }
+
+    /// The best variant of the file the client accepts. The files are prepared in the background:
+    /// if the variant is not ready yet, the file is put into the priority queues - it is taken
+    /// right after the files in progress, and the request waits for it. It is prepared sooner
+    /// or later: all the files are in the queues
+    async fn wait_for_variant<'f>(
+        &self,
+        file: &'f Arc<ContentFile>,
+        accepted: AcceptedEncodings,
+    ) -> Result<(&'f FileVariant, Option<CompressionAlgorithm>), &'f str> {
+        let mut is_prioritized = false;
+
+        loop {
+            match file.choose_variant(accepted) {
+                VariantChoice::Ready(variant, encoding) => return Ok((variant, encoding)),
+                VariantChoice::Failed(err) => return Err(err),
+                VariantChoice::NotReady => {}
+            }
+
+            if !is_prioritized {
+                self.compression_queue.prioritize(file);
+                is_prioritized = true;
+            }
+
+            tokio::time::sleep(PREPARED_FILE_CHECK_INTERVAL).await;
+        }
     }
 
     /// Index file of the folder is served as the file itself - so the no-cache list
@@ -139,54 +217,91 @@ pub fn compile_vary(by_accept_encoding: bool, by_user_agent: bool) -> Option<&'s
     }
 }
 
-/// Puts the caching headers on the response. No etag means - the content must not be cached
-pub fn apply_cache_headers(
-    builder: HttpResultBuilder,
-    etag: Option<String>,
-    vary: Option<&'static str>,
-) -> HttpResultBuilder {
-    let builder = match vary {
-        Some(vary) => builder.add_header("Vary", vary),
-        None => builder,
-    };
+/// The response the headers are put on: the content which is sent in one piece -
+/// or the stream of the chunks. Both of them get the same headers
+pub trait ResponseHeaders: Sized {
+    fn put_header(self, name: &'static str, value: impl Into<String>) -> Self;
+}
 
-    match etag {
-        Some(etag) => builder
-            .add_header("ETag", etag)
-            .add_header("Cache-Control", "no-cache"),
-        None => builder
-            .add_header("Cache-Control", NO_CACHE_CACHE_CONTROL)
-            .add_header("Pragma", NO_CACHE_PRAGMA)
-            .add_header("Expires", NO_CACHE_EXPIRES),
+impl ResponseHeaders for HttpResultBuilder {
+    fn put_header(self, name: &'static str, value: impl Into<String>) -> Self {
+        self.add_header(name, value.into())
     }
 }
 
-pub fn compile_error(uri_path: &str, err: std::io::Error) -> HttpFailResult {
+impl ResponseHeaders for HttpOutputAsStream {
+    fn put_header(self, name: &'static str, value: impl Into<String>) -> Self {
+        self.with_header(name, value.into())
+    }
+}
+
+/// The headers of the file variant: the protection, the caching and the encoding of the copy
+fn apply_variant_headers<T: ResponseHeaders>(
+    response: T,
+    etag: Option<String>,
+    encoding: Option<CompressionAlgorithm>,
+    params: &ServeParams<'_>,
+) -> T {
+    let response = apply_security_headers(response, params.allow_framing);
+    let response = apply_cache_headers(
+        response,
+        etag,
+        compile_vary(true, params.vary_by_user_agent),
+    );
+
+    match encoding {
+        Some(algorithm) => response.put_header("Content-Encoding", algorithm.as_str()),
+        None => response,
+    }
+}
+
+/// Puts the headers which protect the content on the response - whatever the content is.
+/// Content-Security-Policy is not here: it depends on the application, so it is set
+/// by the application itself or by the ingress in front of the service
+pub fn apply_security_headers<T: ResponseHeaders>(response: T, allow_framing: bool) -> T {
+    let response = response
+        .put_header(NOSNIFF_HEADER.0, NOSNIFF_HEADER.1)
+        .put_header(REFERRER_POLICY_HEADER.0, REFERRER_POLICY_HEADER.1);
+
+    if allow_framing {
+        return response;
+    }
+
+    response.put_header(FRAME_OPTIONS_HEADER.0, FRAME_OPTIONS_HEADER.1)
+}
+
+/// Puts the caching headers on the response. No etag means - the content must not be cached
+pub fn apply_cache_headers<T: ResponseHeaders>(
+    response: T,
+    etag: Option<String>,
+    vary: Option<&'static str>,
+) -> T {
+    let response = match vary {
+        Some(vary) => response.put_header("Vary", vary),
+        None => response,
+    };
+
+    match etag {
+        Some(etag) => response
+            .put_header("ETag", etag)
+            .put_header("Cache-Control", "no-cache"),
+        None => response
+            .put_header("Cache-Control", NO_CACHE_CACHE_CONTROL)
+            .put_header("Pragma", NO_CACHE_PRAGMA)
+            .put_header("Expires", NO_CACHE_EXPIRES),
+    }
+}
+
+pub fn compile_error(uri_path: &str, err: impl std::fmt::Display) -> HttpFailResult {
     HttpFailResult::as_fatal_error(format!(
         "Can not prepare the content of '{}'. Err: {}",
         uri_path, err
     ))
 }
 
-fn has_the_same_etag(ctx: &HttpContext, etag: &str) -> bool {
-    let Some(header) = ctx
-        .request
-        .get_headers()
-        .try_get_case_insensitive("if-none-match")
-    else {
-        return false;
-    };
-
-    let Ok(header) = header.as_str() else {
-        return false;
-    };
-
-    header == etag
-}
-
 #[cfg(test)]
 mod tests {
-    use super::super::{ContentFile, FileVariant, TestFolder};
+    use super::super::{calc_etag, TestFolder};
     use super::*;
 
     /// File the reader has found - with the content of its raw file
@@ -198,12 +313,13 @@ mod tests {
 
     /// Looks the file up in the content of the test site - its 'wwwroot' folder
     fn find_file(site: &TestFolder, folders: &[&str], uri_path: &str) -> Found {
-        let content_files = ContentFiles::create(site.get_folder("wwwroot").as_str(), &[""], &[]);
-        let reader = StaticFilesReader::new(content_files, vec![]);
+        let content_files = ContentFiles::scan(site.get_folder("wwwroot").as_str(), &[""]);
+        let reader =
+            StaticFilesReader::new(content_files, Arc::new(CompressionQueue::default()), vec![]);
         let found_file = reader.find_file(uri_path, folders).unwrap();
 
         Found {
-            content: std::fs::read_to_string(found_file.file.raw.path.as_str()).unwrap(),
+            content: std::fs::read_to_string(found_file.file.raw_path.as_str()).unwrap(),
             uri_path: found_file.uri_path,
             is_index_file: found_file.is_index_file,
         }
@@ -352,6 +468,47 @@ mod tests {
         }
     }
 
+    /// 'If-None-Match' is read by the library - this is the contract the service relies on.
+    /// The previous versions of the service sent the same hash without the quotes: the clients
+    /// which keep such an etag get 304, not the whole content once again
+    #[test]
+    fn matches_the_etag_in_the_if_none_match_header() {
+        let etag = calc_etag(b"content");
+        let previous_version_etag = etag.trim_matches('"').to_string();
+        let weak_etag = format!("W/{}", etag);
+        let etag_in_list = format!("\"xyz\", {}", etag);
+
+        for if_none_match in [
+            etag.as_str(),
+            previous_version_etag.as_str(),
+            weak_etag.as_str(),
+            etag_in_list.as_str(),
+            "*",
+        ] {
+            assert!(
+                my_http_server::if_none_match_matches([if_none_match], etag.as_str()),
+                "{}",
+                if_none_match
+            );
+        }
+
+        // the header sent as several lines is one list
+        assert!(my_http_server::if_none_match_matches(
+            ["\"xyz\"", etag.as_str()],
+            etag.as_str()
+        ));
+
+        let other_etag = calc_etag(b"other content");
+
+        for if_none_match in ["\"xyz\"", other_etag.as_str(), ""] {
+            assert!(
+                !my_http_server::if_none_match_matches([if_none_match], etag.as_str()),
+                "{}",
+                if_none_match
+            );
+        }
+    }
+
     #[test]
     fn sends_one_vary_header() {
         assert_eq!(
@@ -366,18 +523,85 @@ mod tests {
     fn has_to_disable_caching(no_cache: &[&str], request_path: &str, uri_path: &str) -> bool {
         let no_cache = no_cache.iter().map(|itm| itm.to_string()).collect();
 
-        let file = ContentFile {
-            raw: FileVariant {
-                path: String::new(),
-                etag: String::new(),
-            },
-            copies: vec![],
-        };
+        let file = Arc::new(ContentFile::new(uri_path.to_string(), String::new(), 0));
 
-        StaticFilesReader::new(ContentFiles::default(), no_cache).has_to_disable_caching(
+        StaticFilesReader::new(
+            ContentFiles::default(),
+            Arc::new(CompressionQueue::default()),
+            no_cache,
+        )
+        .has_to_disable_caching(
             &HttpPath::from_str(request_path),
             &FoundFile::as_requested(&file, uri_path.to_string()),
         )
+    }
+
+    #[tokio::test]
+    async fn waits_for_the_file_prepared_in_the_background() {
+        let site = create_test_site("wait-prepared");
+        let www_root = site.get_folder("wwwroot");
+
+        let content_files = ContentFiles::scan(www_root.as_str(), &[""]);
+        let queue = Arc::new(CompressionQueue::default());
+        queue.enqueue(content_files.files_by_size());
+
+        let reader = StaticFilesReader::new(content_files, queue.clone(), vec![]);
+        let found_file = reader
+            .find_file("/es/app.js", &[www_root.as_str()])
+            .unwrap();
+
+        assert!(found_file.file.get_raw().is_none());
+
+        // the background thread starts preparing later than the request comes
+        let background = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            queue.prepare_all(&[]);
+        });
+
+        let (variant, encoding) = reader
+            .wait_for_variant(found_file.file, AcceptedEncodings::default())
+            .await
+            .unwrap();
+
+        assert_eq!(encoding, None);
+        assert_eq!(
+            std::fs::read_to_string(variant.path.as_str()).unwrap(),
+            "es-app"
+        );
+
+        background.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn gets_the_failed_preparation_instead_of_waiting_forever() {
+        let site = create_test_site("wait-failed");
+        let www_root = site.get_folder("wwwroot");
+
+        let content_files = ContentFiles::scan(www_root.as_str(), &[""]);
+        let queue = Arc::new(CompressionQueue::default());
+        queue.enqueue(content_files.files_by_size());
+
+        let reader = StaticFilesReader::new(content_files, queue.clone(), vec![]);
+        let found_file = reader
+            .find_file("/es/app.js", &[www_root.as_str()])
+            .unwrap();
+
+        // the file is removed after the scan - it can not be read any more
+        std::fs::remove_file(found_file.file.raw_path.as_str()).unwrap();
+
+        let background = std::thread::spawn(move || queue.prepare_all(&[]));
+
+        let accepted = AcceptedEncodings {
+            brotli: true,
+            gzip: true,
+        };
+
+        assert!(reader
+            .wait_for_variant(found_file.file, accepted)
+            .await
+            .is_err());
+
+        background.join().unwrap();
     }
 
     #[test]

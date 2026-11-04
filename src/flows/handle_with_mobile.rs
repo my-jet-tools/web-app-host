@@ -17,12 +17,13 @@ pub async fn handle_with_mobile(
             device_folder.fallback().www_root(),
         ],
         vary_by_user_agent: true,
+        allow_framing: crate::app::APP_CTX.allow_framing,
     };
 
     let found_file = static_files.find_file(ctx.request.http_path.as_str(), params.folders)?;
 
     if crate::app::APP_CTX.has_to_inject_version(found_file.uri_path.as_str()) {
-        return crate::scripts::inject_version(&found_file, params.vary_by_user_agent).await;
+        return crate::scripts::inject_version(&found_file, &params).await;
     }
 
     static_files

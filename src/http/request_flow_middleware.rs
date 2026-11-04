@@ -21,6 +21,7 @@ impl HttpServerMiddleware for RequestFlowMiddleware {
         // path which leads out of the root folder is not served at all - so nobody can read
         // the files of the system
         if !is_safe_uri_path(ctx.request.http_path.as_str()) {
+            crate::scripts::write_rejected_request_log(ctx, "Path leads out of the root folder");
             return Some(Err(HttpFailResult::as_forbidden(Some("Forbidden"))));
         }
 

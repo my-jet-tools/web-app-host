@@ -13,14 +13,16 @@ rust-extensions = { tag = "0.1.5", git = "https://github.com/MyJetTools/rust-ext
 rust-common = { tag = "0.1.1", git = "https://github.com/MyJetTools/rust-common.git", default-features = false, features = [
     "user_agent",
 ] }
-async-trait = "*"
-lazy_static = "*"
+# the versions are pinned to the major ones and Cargo.lock is committed: the release build
+# gets the audited dependencies, not whatever is published at the moment of the build
+async-trait = "0.1"
+lazy_static = "1.5"
 
 # static files serving - our own implementation, since the root folder of the content
 # is chosen per request (desktop/mobile), and we fully control the caching headers
-base64 = "*"
-sha2 = "*"
-flate2 = "*"
-brotli = "*"
+base64 = "0.23"
+sha2 = "0.11"
+flate2 = "1.1"
+brotli = "9.1"
 
-tokio = { version = "*", features = ["full"] }
+tokio = { version = "1", features = ["full"] }

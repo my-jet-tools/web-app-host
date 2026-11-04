@@ -4,22 +4,38 @@ use sha2::{Digest, Sha256};
 
 const BASIC_SCHEME: &str = "basic ";
 
+/// Result of the check of the Basic authentication
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BasicAuthResult {
+    /// The request has the right password
+    Passed,
+    /// The request has no credentials at all. The browser sends the first request without them
+    /// and asks the user for the password after 401 - so it is not an attempt to guess it
+    NoCredentials,
+    /// The request has the credentials, but they are wrong - or they are not the Basic ones
+    Failed,
+}
+
 /// Checks the credentials of the Basic authentication. Only the password is checked -
 /// any login with the right password is accepted
-pub fn is_basic_auth_passed(ctx: &HttpContext, password: &str) -> bool {
+pub fn check_basic_auth(ctx: &HttpContext, password: &str) -> BasicAuthResult {
     let Some(header) = ctx
         .request
         .get_headers()
         .try_get_case_insensitive("authorization")
     else {
-        return false;
+        return BasicAuthResult::NoCredentials;
     };
 
     let Ok(header) = header.as_str() else {
-        return false;
+        return BasicAuthResult::Failed;
     };
 
-    has_the_password(header, password)
+    if has_the_password(header, password) {
+        BasicAuthResult::Passed
+    } else {
+        BasicAuthResult::Failed
+    }
 }
 
 fn has_the_password(authorization_header: &str, password: &str) -> bool {

@@ -1,4 +1,13 @@
+use std::time::Duration;
+
 use my_http_server::{HttpContext, HttpFailResult, HttpOkResult, HttpOutput, HttpServerMiddleware};
+
+use crate::scripts::BasicAuthResult;
+
+/// The answer to the wrong password is delayed: whoever guesses the password gets the answer
+/// to each guess no faster than this. Only the request with the wrong password waits -
+/// the server serves the others meanwhile
+const WRONG_PASSWORD_DELAY: Duration = Duration::from_secs(1);
 
 /// Lets through only the requests authenticated with the Basic authentication.
 /// The rest get 401 - so the browser asks for the password
@@ -25,8 +34,18 @@ impl HttpServerMiddleware for BasicAuthMiddleware {
         &self,
         ctx: &mut HttpContext,
     ) -> Option<Result<HttpOkResult, HttpFailResult>> {
-        if crate::scripts::is_basic_auth_passed(ctx, self.password.as_str()) {
-            return None;
+        match crate::scripts::check_basic_auth(ctx, self.password.as_str()) {
+            BasicAuthResult::Passed => return None,
+            // the browser asks the user for the password after this 401 - it is not an attempt yet
+            BasicAuthResult::NoCredentials => {}
+            BasicAuthResult::Failed => {
+                crate::scripts::write_rejected_request_log(
+                    ctx,
+                    "Wrong password of the Basic authentication",
+                );
+
+                tokio::time::sleep(WRONG_PASSWORD_DELAY).await;
+            }
         }
 
         let result = HttpOutput::as_unauthorized(None)

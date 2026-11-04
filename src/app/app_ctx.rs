@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use rust_extensions::AppStates;
 
-use crate::models::{DESKTOP_FOLDER, MOBILE_FOLDER};
+use crate::{
+    models::{DESKTOP_FOLDER, MOBILE_FOLDER},
+    static_files::CompressionQueue,
+};
 
 pub const DEFAULT_WWW_ROOT: &str = "./wwwroot";
 
@@ -36,6 +39,13 @@ pub struct AppContext {
     pub basic_auth_password: Option<String>,
     /// robots.txt which forbids the crawlers to crawl the site is served
     pub no_robots: bool,
+    /// The pages may be shown in the frames of the other sites. By default only the pages
+    /// of the same site may frame them
+    pub allow_framing: bool,
+
+    /// Background executor which prepares the files of the content one by one: reads them,
+    /// calculates the etags and creates the compressed copies
+    pub compression_queue: Arc<CompressionQueue>,
 }
 
 impl AppContext {
@@ -53,7 +63,9 @@ impl AppContext {
             mobile_www_root: format!("{}{}", www_root, MOBILE_FOLDER),
             www_root,
             basic_auth_password: get_basic_auth_password(),
-            no_robots: get_no_robots(),
+            no_robots: get_flag("NO_ROBOTS"),
+            allow_framing: get_flag("ALLOW_FRAMING"),
+            compression_queue: Arc::new(CompressionQueue::default()),
         }
     }
 
@@ -145,8 +157,9 @@ fn get_basic_auth_password() -> Option<String> {
     Some(password)
 }
 
-fn get_no_robots() -> bool {
-    match std::env::var("NO_ROBOTS") {
+/// The flag is on when the variable is 'true' (in any case) or '1'
+fn get_flag(name: &str) -> bool {
+    match std::env::var(name) {
         Ok(value) => {
             let value = value.trim();
             value == "1" || value.eq_ignore_ascii_case("true")
