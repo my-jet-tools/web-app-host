@@ -20,13 +20,13 @@ Features:
 
 | Variable | Default | Description |
 |---|---|---|
-| `UNIX_SOCKET` | not set | Unix only. Path to a Unix socket. If set, the server also listens on this socket (TCP `:8000` stays on in any case). In the Docker image the folder of the socket must be writable by the user `web-app-host` (UID `10001`). |
+| `UNIX_SOCKET` | not set | Unix only. Path to a Unix socket. If set, the server also listens on this socket (TCP `:8000` stays on in any case). |
 | `WWW_ROOT` | `./wwwroot` | Root folder of the content. A trailing `/` is ignored. With `WITH_MOBILE=1` the `desktop` and `mobile` folders are inside it. |
 | `BUILD_NAME` | `web-app-host` (`CARGO_PKG_NAME`) | Application name returned by the `is-alive` endpoint. |
 | `BUILD_VERSION` | `CARGO_PKG_VERSION` from `Cargo.toml` | Application version. Returned by `is-alive` and substituted for `${APP_VERSION}` in the injected file. |
 | `COMPILE_TIME` | empty string | Build timestamp. Substituted for `${APP_COMPILE_TIME}` in the injected file. |
 | `FILE_TO_VERSION_INJECTION` | not set | Path of the file (relative to the site root) in which `${APP_VERSION}` and `${APP_COMPILE_TIME}` are substituted at serve time. If not set, the injection is disabled. |
-| `HOME` | set by the system (`/home/web-app-host` in the Docker image) | Folder in which the compressed copies of the content are created at startup: `$HOME/wwwroot-br` and `$HOME/wwwroot-gzip`. If not set, no copies are created and files are served uncompressed. See [Compression](#compression). |
+| `HOME` | set by the system (`/root` in the Docker image) | Folder in which the compressed copies of the content are created at startup: `$HOME/wwwroot-br` and `$HOME/wwwroot-gzip`. If not set, no copies are created and files are served uncompressed. See [Compression](#compression). |
 | `ENV_INFO` | not set | Returned by `is-alive` as is. The endpoint stays open even with `BASIC-AUTH`, so do not put anything secret here. |
 | `WITH_MOBILE` | not set | `=1` enables the desktop/mobile mode: content is served from `./wwwroot/desktop` and `./wwwroot/mobile`. Any other value, or no variable, serves `./wwwroot` as usual. |
 | `BASIC-AUTH` | not set | Basic Auth password. If set and not empty, a request without the correct password gets `401` with `WWW-Authenticate: Basic`, and the browser shows a login prompt. Any login is accepted — only the password is checked. A name with a dash cannot be set via `export` in a shell, so `BASIC_AUTH` is accepted as well. |
@@ -136,8 +136,7 @@ How it works:
 
 ## Docker image
 
-- The service runs as the non-root user `web-app-host` with the fixed UID `10001`, so Kubernetes can check `runAsNonRoot`. Its home folder `/home/web-app-host` keeps the compressed copies of the content.
-- The content in `/app/wwwroot` only has to be readable by this user.
+- The service runs as `root`: the compressed copies of the content are kept in `/root/wwwroot-br` and `/root/wwwroot-gzip`.
 - The release workflow builds with the committed `Cargo.lock` and runs `cargo audit` before the build: a dependency with a known vulnerability stops the release.
 
 ## Run example
