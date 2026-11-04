@@ -27,9 +27,6 @@ brotli = "9.1"
 
 tokio = { version = "1", features = ["full"] }
 
-# jemalloc gives the freed memory back to the system - the one brotli takes while it compresses
-# a big file goes back right after it. It is built from the C sources and linked statically:
-# the image needs nothing for it. It does not support the MSVC targets
-[target.'cfg(not(target_env = "msvc"))'.dependencies]
+# Production runs on Linux only; other platforms (macOS dev builds) use the system allocator.
+[target.'cfg(target_os = "linux")'.dependencies]
 tikv-jemallocator = "*"
-tikv-jemalloc-sys = "*"
