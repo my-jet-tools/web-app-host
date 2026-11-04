@@ -79,7 +79,7 @@ impl ContentFile {
 /// with the etag and the compressed copies of its content at the start
 #[derive(Default)]
 pub struct ContentFiles {
-    /// The key is the path of the raw file
+    /// The key is the path the request is mapped to: the site folder and the uri path of the file
     files: HashMap<String, ContentFile>,
 }
 
@@ -93,14 +93,22 @@ impl ContentFiles {
 
         let mut raw_files = Vec::new();
 
-        for site_folder in site_folders {
-            let folder = format!("{}{}", www_root, site_folder);
-            collect_files(
-                Path::new(folder.as_str()),
-                site_folder,
-                &mut Vec::new(),
-                &mut raw_files,
-            );
+        // the content is served only from within the root folder: the symlink which leads
+        // out of it is not followed
+        match std::fs::canonicalize(www_root) {
+            Ok(root) => {
+                for site_folder in site_folders {
+                    let folder = format!("{}{}", www_root, site_folder);
+                    collect_files(
+                        Path::new(folder.as_str()),
+                        site_folder,
+                        &root,
+                        &mut Vec::new(),
+                        &mut raw_files,
+                    );
+                }
+            }
+            Err(err) => println!("Can not read the folder '{}'. Err: {}", www_root, err),
         }
 
         // the biggest files take the most time - they go first, so no thread is left
@@ -112,7 +120,10 @@ impl ContentFiles {
         }
     }
 
-    /// File of the site folder - by the path of the request
+    /// File of the site folder - by the path of the request. It is the only way the request
+    /// reaches the disk: the file is read by the path resolved at the scan, never by the path
+    /// of the request. So even the path which gets through `is_safe_uri_path` (with the double
+    /// encoded dots, for example) resolves to the scanned file of the root folder - or to nothing
     pub fn get(&self, folder: &str, uri_path: &str) -> Option<&ContentFile> {
         self.files.get(compile_file_name(folder, uri_path).as_str())
     }
@@ -170,30 +181,28 @@ fn recreate_folder(path: &str) -> std::io::Result<()> {
 struct RawFile {
     /// Path of the file within the root folder: '/es/app.js' - or '/mobile/es/app.js'
     uri_path: String,
+    /// Real location of the file - with the symlinks resolved. It is checked to be within
+    /// the root folder, and the file is read by it: the symlink re-pointed after the scan
+    /// does not lead the requests out of the root folder
+    real_path: String,
     size: u64,
 }
 
-/// Collects the files of the folder and of its subfolders. Symlinks are followed -
-/// except the one to the folder above it: such a loop would never end
+/// Collects the files of the folder and of its subfolders. Symlinks are followed only within
+/// the root folder - the content outside of it is never served. The symlink to the folder above
+/// is not followed as well: such a loop would never end
 fn collect_files(
     folder: &Path,
     uri_path: &str,
+    root: &Path,
     ancestors: &mut Vec<PathBuf>,
     result: &mut Vec<RawFile>,
 ) {
-    let canonical = match std::fs::canonicalize(folder) {
-        Ok(canonical) => canonical,
-        Err(err) => {
-            println!(
-                "Can not read the folder '{}'. Err: {}",
-                folder.display(),
-                err
-            );
-            return;
-        }
+    let Some(real_folder) = resolve_within_root(folder, root) else {
+        return;
     };
 
-    if ancestors.contains(&canonical) {
+    if ancestors.contains(&real_folder) {
         return;
     }
 
@@ -209,7 +218,7 @@ fn collect_files(
         }
     };
 
-    ancestors.push(canonical);
+    ancestors.push(real_folder);
 
     for entry in entries.flatten() {
         // the name which is not utf-8 can not be requested
@@ -226,16 +235,50 @@ fn collect_files(
         };
 
         if metadata.is_dir() {
-            collect_files(&path, file_uri_path.as_str(), ancestors, result);
+            collect_files(&path, file_uri_path.as_str(), root, ancestors, result);
         } else if metadata.is_file() {
+            let Some(real_path) = resolve_within_root(&path, root) else {
+                continue;
+            };
+
+            // the path which is not utf-8 can not be read by the string path
+            let Ok(real_path) = real_path.into_os_string().into_string() else {
+                continue;
+            };
+
             result.push(RawFile {
                 uri_path: file_uri_path,
+                real_path,
                 size: metadata.len(),
             });
         }
     }
 
     ancestors.pop();
+}
+
+/// Real location of the file or of the folder - if it is within the root folder.
+/// The symlink which leads out of it is skipped
+fn resolve_within_root(path: &Path, root: &Path) -> Option<PathBuf> {
+    let real_path = match std::fs::canonicalize(path) {
+        Ok(real_path) => real_path,
+        Err(err) => {
+            println!("Can not read '{}'. Err: {}", path.display(), err);
+            return None;
+        }
+    };
+
+    if real_path.starts_with(root) {
+        return Some(real_path);
+    }
+
+    println!(
+        "Skipping '{}' - it leads out of the content root to '{}'",
+        path.display(),
+        real_path.display()
+    );
+
+    None
 }
 
 /// Compiles the files in all the threads we have - their number respects the CPU limit
@@ -262,11 +305,9 @@ fn compile_in_parallel(
                     while let Some(raw_file) =
                         raw_files.get(next_file.fetch_add(1, Ordering::Relaxed))
                     {
-                        if let Some(content_file) = compile_content_file(
-                            www_root,
-                            raw_file.uri_path.as_str(),
-                            copies_folders,
-                        ) {
+                        if let Some(content_file) =
+                            compile_content_file(www_root, raw_file, copies_folders)
+                        {
                             result.push(content_file);
                         }
                     }
@@ -283,26 +324,29 @@ fn compile_in_parallel(
                     .join()
                     .expect("Compression of the content has panicked")
             })
-            .map(|content_file| (content_file.raw.path.clone(), content_file))
             .collect()
     })
 }
 
-/// Reads the raw file and creates its compressed copies. The file we can not read is not served
+/// Reads the raw file and creates its compressed copies. The file we can not read is not served.
+/// Returns the file with the path the request is mapped to
 fn compile_content_file(
     www_root: &str,
-    uri_path: &str,
+    raw_file: &RawFile,
     copies_folders: &[&CopiesFolder],
-) -> Option<ContentFile> {
-    let raw_path = format!("{}{}", www_root, uri_path);
-
-    let raw = match std::fs::read(raw_path.as_str()) {
+) -> Option<(String, ContentFile)> {
+    let raw = match std::fs::read(raw_file.real_path.as_str()) {
         Ok(raw) => raw,
         Err(err) => {
-            println!("Can not read the file '{}'. Err: {}", raw_path, err);
+            println!(
+                "Can not read the file '{}'. Err: {}",
+                raw_file.real_path, err
+            );
             return None;
         }
     };
+
+    let uri_path = raw_file.uri_path.as_str();
 
     let copies = if is_compressed_format(uri_path) {
         vec![]
@@ -313,13 +357,15 @@ fn compile_content_file(
             .collect()
     };
 
-    Some(ContentFile {
+    let content_file = ContentFile {
         raw: FileVariant {
             etag: calc_etag(raw.as_slice()),
-            path: raw_path,
+            path: raw_file.real_path.clone(),
         },
         copies,
-    })
+    };
+
+    Some((format!("{}{}", www_root, uri_path), content_file))
 }
 
 /// Creates the copy of the file compressed with the algorithm of the folder - if it makes sense
@@ -378,6 +424,15 @@ mod tests {
         compile_copies_folders(site.path.to_str().unwrap())
     }
 
+    /// Real location of the file - the temp folder itself is a symlink on macOS
+    fn real_path(path: &str) -> String {
+        std::fs::canonicalize(path)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
     #[test]
     fn creates_the_compressed_copies() {
         let site = TestFolder::new("compressed-copies");
@@ -394,7 +449,7 @@ mod tests {
         assert_eq!(content_files.files_count(), 3);
 
         let file = content_files.get(www_root.as_str(), "/es/app.js").unwrap();
-        assert_eq!(file.raw.path, format!("{}/es/app.js", www_root));
+        assert_eq!(file.raw.path, real_path(&format!("{}/es/app.js", www_root)));
 
         let algorithms: Vec<_> = file.copies.iter().map(|copy| copy.algorithm).collect();
         assert_eq!(algorithms, CompressionAlgorithm::ALL);
@@ -563,28 +618,94 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn follows_the_symlinks_without_the_loops() {
-        let site = TestFolder::new("symlinks");
+    fn follows_the_symlinks_within_the_root() {
+        let site = TestFolder::new("symlinks-within-root");
 
         site.add_file("wwwroot/es/app.js", "app")
-            .add_file("shared/lib.js", "lib");
+            .add_file("wwwroot/shared/lib.js", "lib");
 
         let www_root = site.get_folder("wwwroot");
+        let symlink = |target: &str, link: &str| {
+            std::os::unix::fs::symlink(site.path.join(target), site.path.join(link)).unwrap()
+        };
 
-        std::os::unix::fs::symlink(site.path.join("shared"), site.path.join("wwwroot/es/lib"))
-            .unwrap();
-        std::os::unix::fs::symlink(site.path.join("wwwroot"), site.path.join("wwwroot/es/loop"))
-            .unwrap();
+        symlink("wwwroot/shared", "wwwroot/es/lib");
+        symlink("wwwroot/shared/lib.js", "wwwroot/lib.js");
+        symlink("wwwroot", "wwwroot/es/loop");
 
         let content_files = ContentFiles::create(www_root.as_str(), &[""], &[]);
 
         assert!(content_files.get(www_root.as_str(), "/es/app.js").is_some());
-        assert!(content_files
-            .get(www_root.as_str(), "/es/lib/lib.js")
-            .is_some());
+
+        // the file is read by its real location - whatever path it is requested by
+        let lib_path = real_path(&format!("{}/shared/lib.js", www_root));
+
+        for uri_path in ["/shared/lib.js", "/es/lib/lib.js", "/lib.js"] {
+            let file = content_files.get(www_root.as_str(), uri_path).unwrap();
+            assert_eq!(file.raw.path, lib_path, "{}", uri_path);
+        }
+
         assert!(content_files
             .get(www_root.as_str(), "/es/loop/es/app.js")
             .is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn does_not_follow_the_symlinks_out_of_the_root() {
+        let site = TestFolder::new("symlinks-out-of-root");
+
+        site.add_file("wwwroot/app.js", "app")
+            .add_file("outside/secret.txt", "secret")
+            .add_file("wwwroot-evil/secret.txt", "secret");
+
+        let www_root = site.get_folder("wwwroot");
+        let symlink = |target: &str, link: &str| {
+            std::os::unix::fs::symlink(site.path.join(target), site.path.join(link)).unwrap()
+        };
+
+        symlink("outside/secret.txt", "wwwroot/leak.txt");
+        symlink("outside", "wwwroot/leak-folder");
+        // the folder whose name starts with the name of the root folder is not within it
+        symlink("wwwroot-evil", "wwwroot/evil");
+
+        let content_files = ContentFiles::create(www_root.as_str(), &[""], &[]);
+
+        assert_eq!(content_files.files_count(), 1);
+        assert!(content_files.get(www_root.as_str(), "/app.js").is_some());
+
+        for uri_path in ["/leak.txt", "/leak-folder/secret.txt", "/evil/secret.txt"] {
+            assert!(
+                content_files.get(www_root.as_str(), uri_path).is_none(),
+                "{}",
+                uri_path
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_re_pointed_after_the_scan_does_not_lead_out_of_the_root() {
+        let site = TestFolder::new("symlinks-re-pointed");
+
+        site.add_file("wwwroot/shared/lib.js", "lib")
+            .add_file("outside/secret.txt", "secret");
+
+        let www_root = site.get_folder("wwwroot");
+        let link = site.path.join("wwwroot/lib.js");
+
+        std::os::unix::fs::symlink(site.path.join("wwwroot/shared/lib.js"), &link).unwrap();
+
+        let content_files = ContentFiles::create(www_root.as_str(), &[""], &[]);
+
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(site.path.join("outside/secret.txt"), &link).unwrap();
+
+        let file = content_files.get(www_root.as_str(), "/lib.js").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(file.raw.path.as_str()).unwrap(),
+            "lib"
+        );
     }
 
     #[test]

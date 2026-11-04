@@ -1,6 +1,6 @@
 use my_http_server::{HttpFailResult, HttpOkResult, HttpOutput, WebContentType};
 
-use crate::static_files::{apply_cache_headers, compile_error, FoundFile};
+use crate::static_files::{apply_cache_headers, compile_error, compile_vary, FoundFile};
 
 /// Replaces the version placeholders in the content of the file we have found.
 /// The placeholders are in the raw file - so it is sent uncompressed, whatever the client
@@ -24,7 +24,8 @@ pub async fn inject_version(
         WebContentType::detect_by_extension(found_file.uri_path.as_str()),
     );
 
-    let result = apply_cache_headers(builder, None, vary_by_user_agent)
+    // the injected file is always sent uncompressed - it does not depend on 'Accept-Encoding'
+    let result = apply_cache_headers(builder, None, compile_vary(false, vary_by_user_agent))
         .set_content(content.into_bytes())
         .into_ok_result(false);
 

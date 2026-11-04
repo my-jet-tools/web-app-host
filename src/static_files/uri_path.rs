@@ -3,7 +3,12 @@ use crate::models::INDEX_FILE;
 /// Path does not lead out of the root folder: '.' and '..' segments are not allowed,
 /// backslash is not allowed as well - since it separates the segments on Windows.
 /// The path comes as it is in the request line - so the percent-encoded dots
-/// and separators are checked as the plain ones
+/// and separators are checked as the plain ones.
+///
+/// It is the first line of the defense only: the encoding is decoded once, so the double
+/// encoded dots ('%252e') get through. What keeps the requests within the root folder
+/// is `ContentFiles` - the request is resolved only to the files scanned within it,
+/// and the disk is never read by the path of the request
 pub fn is_safe_uri_path(uri_path: &str) -> bool {
     if uri_path.contains('%') {
         return has_no_dot_segments(decode_dots_and_separators(uri_path).as_str());

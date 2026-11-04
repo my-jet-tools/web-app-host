@@ -98,13 +98,12 @@ impl StaticFilesReader {
             Err(err) => return Some(Err(compile_error(found_file.uri_path.as_str(), err))),
         };
 
-        let mut builder = HttpOutput::from_builder()
-            .set_content_type_opt(WebContentType::detect_by_extension(
-                found_file.uri_path.as_str(),
-            ))
-            .add_header("Vary", "Accept-Encoding");
+        let builder = HttpOutput::from_builder().set_content_type_opt(
+            WebContentType::detect_by_extension(found_file.uri_path.as_str()),
+        );
 
-        builder = apply_cache_headers(builder, etag, params.vary_by_user_agent);
+        let mut builder =
+            apply_cache_headers(builder, etag, compile_vary(true, params.vary_by_user_agent));
 
         if let Some(algorithm) = encoding {
             builder = builder.add_header("Content-Encoding", algorithm.as_str());
@@ -129,16 +128,26 @@ impl StaticFilesReader {
     }
 }
 
+/// Value of the 'Vary' header: the request headers the content depends on - all in one header.
+/// The caches in the middle should combine several 'Vary' headers, but not all of them do
+pub fn compile_vary(by_accept_encoding: bool, by_user_agent: bool) -> Option<&'static str> {
+    match (by_accept_encoding, by_user_agent) {
+        (true, true) => Some("Accept-Encoding, User-Agent"),
+        (true, false) => Some("Accept-Encoding"),
+        (false, true) => Some("User-Agent"),
+        (false, false) => None,
+    }
+}
+
 /// Puts the caching headers on the response. No etag means - the content must not be cached
 pub fn apply_cache_headers(
     builder: HttpResultBuilder,
     etag: Option<String>,
-    vary_by_user_agent: bool,
+    vary: Option<&'static str>,
 ) -> HttpResultBuilder {
-    let builder = if vary_by_user_agent {
-        builder.add_header("Vary", "User-Agent")
-    } else {
-        builder
+    let builder = match vary {
+        Some(vary) => builder.add_header("Vary", vary),
+        None => builder,
     };
 
     match etag {
@@ -329,12 +338,29 @@ mod tests {
             "/../private/",
             "/../private",
             "/es/../../private/",
+            "/%2e%2e/secret.txt",
+            "/es%2f..%2f..%2fsecret.txt",
+            // the double encoded dots get through is_safe_uri_path -
+            // but resolve to nothing, since only the scanned files are served
+            "/%252e%252e/secret.txt",
+            "/es/%252e%252e/%252e%252e/secret.txt",
         ] {
             let found_file = find_file(&site, &[www_root.as_str()], uri_path);
 
             assert_eq!(found_file.uri_path, INDEX_FILE, "{}", uri_path);
             assert_eq!(found_file.content, "root", "{}", uri_path);
         }
+    }
+
+    #[test]
+    fn sends_one_vary_header() {
+        assert_eq!(
+            compile_vary(true, true),
+            Some("Accept-Encoding, User-Agent")
+        );
+        assert_eq!(compile_vary(true, false), Some("Accept-Encoding"));
+        assert_eq!(compile_vary(false, true), Some("User-Agent"));
+        assert_eq!(compile_vary(false, false), None);
     }
 
     fn has_to_disable_caching(no_cache: &[&str], request_path: &str, uri_path: &str) -> bool {
